@@ -5,6 +5,8 @@
 package oidc
 
 import (
+	"time"
+
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/compose"
 )
@@ -24,14 +26,31 @@ func PinnipedCLIOIDCClient() *fosite.DefaultOpenIDConnectClient {
 			RedirectURIs:  []string{"http://127.0.0.1/callback"},
 			ResponseTypes: []string{"code"},
 			GrantTypes:    []string{"authorization_code"},
-			Scopes:        []string{"openid", "profile", "email"},
+			Scopes:        []string{"openid", "pinniped:all"}, // TODO require pinniped:all
+			Audience:      []string{},                         // TODO
 		},
 	}
 }
 
-func FositeOauth2Helper(oauthStore interface{}, hmacSecretOfLengthAtLeast32 []byte) fosite.OAuth2Provider {
+func FositeOauth2Helper(issuerURL string, oauthStore fosite.Storage, hmacSecretOfLengthAtLeast32 []byte) fosite.OAuth2Provider {
 	oauthConfig := &compose.Config{
-		EnforcePKCEForPublicClients: true,
+		AuthorizeCodeLifespan: 3 * time.Minute,
+
+		IDTokenLifespan:     10 * time.Minute,
+		AccessTokenLifespan: 10 * time.Minute,
+
+		RefreshTokenLifespan: 16 * time.Hour,
+
+		IDTokenIssuer: issuerURL,
+		TokenURL:      "TODO", // TODO
+
+		ScopeStrategy:            fosite.ExactScopeStrategy, // be careful
+		AudienceMatchingStrategy: nil,                       // I think the default is fine
+		EnforcePKCE:              true,                      // follow current set of best practices
+		AllowedPromptValues:      []string{"none"},          // eeh?
+
+		RefreshTokenScopes:  nil,
+		MinParameterEntropy: 32, // ?
 	}
 
 	return compose.Compose(
