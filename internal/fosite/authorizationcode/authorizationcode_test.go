@@ -1,3 +1,6 @@
+// Copyright 2020 the Pinniped contributors. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package authorizationcode
 
 import (
@@ -19,12 +22,18 @@ import (
 	"gopkg.in/square/go-jose.v2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	coretesting "k8s.io/client-go/testing"
 )
 
 func TestAuthorizeCodeStorage(t *testing.T) {
 	ctx := context.Background()
+	secretsGVR := schema.GroupVersionResource{
+		Group:    "",
+		Version:  "v1",
+		Resource: "secrets",
+	}
 
 	const namespace = "test-ns"
 
@@ -106,9 +115,56 @@ func TestAuthorizeCodeStorage(t *testing.T) {
 
 				return storage.InvalidateAuthorizeCodeSession(ctx, "fancy-signature")
 			},
-			wantActions: nil,
-			wantSecrets: nil,
-			wantErr:     "",
+			wantActions: []coretesting.Action{
+				coretesting.NewCreateAction(secretsGVR, namespace, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "pinniped-storage-authorization-codes-pwu5zs7lekbhnln2w4",
+						ResourceVersion: "",
+						Labels: map[string]string{
+							"storage.pinniped.dev": "authorization-codes",
+						},
+					},
+					Data: map[string][]byte{
+						"pinniped-storage-data":    []byte(`{"active":true,"request":{"responseTypes":["not-code"],"redirectUri":{"Scheme":"","Opaque":"weee","User":{},"Host":"","Path":"/callback","RawPath":"","ForceQuery":false,"RawQuery":"","Fragment":"","RawFragment":""},"state":"stated","handledResponseTypes":["not-type"],"id":"abcd-1","requestedAt":"0001-01-01T00:00:00Z","client":{"id":"pinny","redirect_uris":null,"grant_types":null,"response_types":null,"scopes":null,"audience":null,"public":true,"jwks_uri":"where","jwks":null,"token_endpoint_auth_method":"something","request_uris":null,"request_object_signing_alg":"","token_endpoint_auth_signing_alg":""},"scopes":null,"grantedScopes":null,"form":{"key":["val"]},"session":{"Claims":null,"Headers":null,"ExpiresAt":null,"Username":"snorlax","Subject":"panda"},"requestedAudience":null,"grantedAudience":null},"version":"1"}`),
+						"pinniped-storage-version": []byte("1"),
+					},
+					Type: "storage.pinniped.dev/authorization-codes",
+				}),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-authorization-codes-pwu5zs7lekbhnln2w4"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-authorization-codes-pwu5zs7lekbhnln2w4"),
+				coretesting.NewUpdateAction(secretsGVR, namespace, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "pinniped-storage-authorization-codes-pwu5zs7lekbhnln2w4",
+						ResourceVersion: "",
+						Labels: map[string]string{
+							"storage.pinniped.dev": "authorization-codes",
+						},
+					},
+					Data: map[string][]byte{
+						"pinniped-storage-data":    []byte(`{"active":false,"request":{"responseTypes":["not-code"],"redirectUri":{"Scheme":"","Opaque":"weee","User":{},"Host":"","Path":"/callback","RawPath":"","ForceQuery":false,"RawQuery":"","Fragment":"","RawFragment":""},"state":"stated","handledResponseTypes":["not-type"],"id":"abcd-1","requestedAt":"0001-01-01T00:00:00Z","client":{"id":"pinny","redirect_uris":null,"grant_types":null,"response_types":null,"scopes":null,"audience":null,"public":true,"jwks_uri":"where","jwks":null,"token_endpoint_auth_method":"something","request_uris":null,"request_object_signing_alg":"","token_endpoint_auth_signing_alg":""},"scopes":null,"grantedScopes":null,"form":{"key":["val"]},"session":{"Claims":null,"Headers":null,"ExpiresAt":null,"Username":"snorlax","Subject":"panda"},"requestedAudience":null,"grantedAudience":null},"version":"1"}`),
+						"pinniped-storage-version": []byte("1"),
+					},
+					Type: "storage.pinniped.dev/authorization-codes",
+				}),
+			},
+			wantSecrets: []corev1.Secret{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "pinniped-storage-authorization-codes-pwu5zs7lekbhnln2w4",
+						Namespace:       namespace,
+						ResourceVersion: "",
+						Labels: map[string]string{
+							"storage.pinniped.dev": "authorization-codes",
+						},
+					},
+					Data: map[string][]byte{
+						"pinniped-storage-data":    []byte(`{"active":false,"request":{"responseTypes":["not-code"],"redirectUri":{"Scheme":"","Opaque":"weee","User":{},"Host":"","Path":"/callback","RawPath":"","ForceQuery":false,"RawQuery":"","Fragment":"","RawFragment":""},"state":"stated","handledResponseTypes":["not-type"],"id":"abcd-1","requestedAt":"0001-01-01T00:00:00Z","client":{"id":"pinny","redirect_uris":null,"grant_types":null,"response_types":null,"scopes":null,"audience":null,"public":true,"jwks_uri":"where","jwks":null,"token_endpoint_auth_method":"something","request_uris":null,"request_object_signing_alg":"","token_endpoint_auth_signing_alg":""},"scopes":null,"grantedScopes":null,"form":{"key":["val"]},"session":{"Claims":null,"Headers":null,"ExpiresAt":null,"Username":"snorlax","Subject":"panda"},"requestedAudience":null,"grantedAudience":null},"version":"1"}`),
+						"pinniped-storage-version": []byte("1"),
+					},
+					Type: "storage.pinniped.dev/authorization-codes",
+				},
+			},
+			wantErr: "",
 		},
 	}
 	for _, tt := range tests {
