@@ -6,9 +6,11 @@ package crud
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"encoding/base32"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -114,9 +116,15 @@ func (s *secretsStorage) Delete(ctx context.Context, signature string) error {
 	return nil
 }
 
+//nolint: gochecknoglobals
+var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+
 func (s *secretsStorage) getName(signature string) string {
-	// hex encoding insures that our secret name is valid per ValidateSecretName in k/k
-	return fmt.Sprintf(secretNameFormat, s.resource, hex.EncodeToString([]byte(signature)))
+	// try to decode base64 signatures to prevent double encoding of binary data
+	signatureBytes := maybeBase64Decode(signature)
+	// lower case base32 encoding insures that our secret name is valid per ValidateSecretName in k/k
+	signatureAsValidName := strings.ToLower(b32.EncodeToString(signatureBytes))
+	return fmt.Sprintf(secretNameFormat, s.resource, signatureAsValidName)
 }
 
 func (s *secretsStorage) toSecret(signature, resourceVersion string, data JSON) (*corev1.Secret, error) {
@@ -139,4 +147,19 @@ func (s *secretsStorage) toSecret(signature, resourceVersion string, data JSON) 
 		},
 		Type: s.secretType,
 	}, nil
+}
+
+func maybeBase64Decode(signature string) []byte {
+	for _, encoding := range []*base64.Encoding{
+		// ordered in most likely used by HMAC, JWT, etc signatures
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	} {
+		if signatureBytes, err := encoding.DecodeString(signature); err == nil {
+			return signatureBytes
+		}
+	}
+	return []byte(signature)
 }

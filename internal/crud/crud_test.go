@@ -69,10 +69,10 @@ func TestStorage(t *testing.T) {
 				return err
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-authorization-codes-6e6f742d657869737473"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-authorization-codes-t2fx46yyvs3a"),
 			},
 			wantSecrets: nil,
-			wantErr:     `failed to get authorization-codes for signature not-exists: secrets "pinniped-storage-authorization-codes-6e6f742d657869737473" not found`,
+			wantErr:     `failed to get authorization-codes for signature not-exists: secrets "pinniped-storage-authorization-codes-t2fx46yyvs3a" not found`,
 		},
 		{
 			name:     "delete non-existent",
@@ -82,10 +82,10 @@ func TestStorage(t *testing.T) {
 				return storage.Delete(ctx, "not-a-token")
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewDeleteAction(secretsGVR, namespace, "pinniped-storage-tokens-6e6f742d612d746f6b656e"),
+				coretesting.NewDeleteAction(secretsGVR, namespace, "pinniped-storage-tokens-t2fx427lnci6s"),
 			},
 			wantSecrets: nil,
-			wantErr:     `failed to delete tokens for signature not-a-token: secrets "pinniped-storage-tokens-6e6f742d612d746f6b656e" not found`,
+			wantErr:     `failed to delete tokens for signature not-a-token: secrets "pinniped-storage-tokens-t2fx427lnci6s" not found`,
 		},
 		{
 			name:     "create and get",
@@ -112,7 +112,7 @@ func TestStorage(t *testing.T) {
 			wantActions: []coretesting.Action{
 				coretesting.NewCreateAction(secretsGVR, namespace, &corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-access-tokens-5235683338426d7737794f61574e79307970423366656839746f4d2d3354327a6c774d5851796545394230",
+						Name:            "pinniped-storage-access-tokens-i6mhp4azwdxshgsy3s2mvedxpxuh3nudh3ot3m4xamlugj4e6qoq",
 						ResourceVersion: "",
 						Labels: map[string]string{
 							"storage.pinniped.dev": "access-tokens",
@@ -124,12 +124,12 @@ func TestStorage(t *testing.T) {
 					},
 					Type: "storage.pinniped.dev/access-tokens",
 				}),
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-access-tokens-5235683338426d7737794f61574e79307970423366656839746f4d2d3354327a6c774d5851796545394230"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-access-tokens-i6mhp4azwdxshgsy3s2mvedxpxuh3nudh3ot3m4xamlugj4e6qoq"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-access-tokens-5235683338426d7737794f61574e79307970423366656839746f4d2d3354327a6c774d5851796545394230",
+						Name:            "pinniped-storage-access-tokens-i6mhp4azwdxshgsy3s2mvedxpxuh3nudh3ot3m4xamlugj4e6qoq",
 						Namespace:       namespace,
 						ResourceVersion: "",
 						Labels: map[string]string{
@@ -151,7 +151,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-pandas-are-best-58584a7359734d57686e534d4a693954584a63504f365344564f32525f5158496d77726f78786e51504138",
+						Name:            "pinniped-storage-pandas-are-best-lvzgyywdc2dhjdbgf5jvzfyphosigvhnsh6qlse3blumogoqhqhq",
 						Namespace:       namespace,
 						ResourceVersion: "",
 						Labels: map[string]string{
@@ -181,12 +181,12 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-pandas-are-best-58584a7359734d57686e534d4a693954584a63504f365344564f32525f5158496d77726f78786e51504138"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-pandas-are-best-lvzgyywdc2dhjdbgf5jvzfyphosigvhnsh6qlse3blumogoqhqhq"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-pandas-are-best-58584a7359734d57686e534d4a693954584a63504f365344564f32525f5158496d77726f78786e51504138",
+						Name:            "pinniped-storage-pandas-are-best-lvzgyywdc2dhjdbgf5jvzfyphosigvhnsh6qlse3blumogoqhqhq",
 						Namespace:       namespace,
 						ResourceVersion: "",
 						Labels: map[string]string{
@@ -208,7 +208,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-stores-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-stores-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "35",
 						Labels: map[string]string{
@@ -255,10 +255,10 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-stores-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-stores-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 				coretesting.NewUpdateAction(secretsGVR, namespace, &corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-stores-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-stores-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						ResourceVersion: "35", // update at initial RV
 						Labels: map[string]string{
 							"storage.pinniped.dev": "stores",
@@ -270,12 +270,12 @@ func TestStorage(t *testing.T) {
 					},
 					Type: "storage.pinniped.dev/stores",
 				}),
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-stores-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-stores-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-stores-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-stores-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "45", // final list at new RV
 						Labels: map[string]string{
@@ -297,7 +297,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-seals-58584a7359734d57686e534d4a693954584a63504f365344564f32525f5158496d77726f78786e51504138",
+						Name:            "pinniped-storage-seals-lvzgyywdc2dhjdbgf5jvzfyphosigvhnsh6qlse3blumogoqhqhq",
 						Namespace:       namespace,
 						ResourceVersion: "",
 						Labels: map[string]string{
@@ -320,7 +320,7 @@ func TestStorage(t *testing.T) {
 				return storage.Delete(ctx, signature)
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewDeleteAction(secretsGVR, namespace, "pinniped-storage-seals-58584a7359734d57686e534d4a693954584a63504f365344564f32525f5158496d77726f78786e51504138"),
+				coretesting.NewDeleteAction(secretsGVR, namespace, "pinniped-storage-seals-lvzgyywdc2dhjdbgf5jvzfyphosigvhnsh6qlse3blumogoqhqhq"),
 			},
 			wantSecrets: nil,
 			wantErr:     "",
@@ -331,7 +331,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -361,12 +361,12 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -388,7 +388,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -418,12 +418,12 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -445,7 +445,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -475,12 +475,12 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -502,7 +502,7 @@ func TestStorage(t *testing.T) {
 			mocks: func(t *testing.T, mock mocker) {
 				err := mock.Tracker().Add(&corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
@@ -531,12 +531,12 @@ func TestStorage(t *testing.T) {
 				return nil
 			},
 			wantActions: []coretesting.Action{
-				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049"),
+				coretesting.NewGetAction(secretsGVR, namespace, "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba"),
 			},
 			wantSecrets: []corev1.Secret{
 				{
 					ObjectMeta: metav1.ObjectMeta{
-						Name:            "pinniped-storage-candies-35615568644e6d66574c5733794b58385a667a357a745335496969574267753336476a612d6f32786c3049",
+						Name:            "pinniped-storage-candies-4wssc5gzt5mlln6iux6gl7hzz3klsirisydaxn7indnpvdnrs5ba",
 						Namespace:       namespace,
 						ResourceVersion: "55",
 						Labels: map[string]string{
