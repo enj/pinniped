@@ -25,9 +25,9 @@ func PinnipedCLIOIDCClient() *fosite.DefaultOpenIDConnectClient {
 			Public:        true,
 			RedirectURIs:  []string{"http://127.0.0.1/callback"},
 			ResponseTypes: []string{"code"},
-			GrantTypes:    []string{"authorization_code"},
-			Scopes:        []string{"openid", "pinniped:all"}, // TODO require pinniped:all
-			Audience:      []string{},                         // TODO
+			GrantTypes:    []string{"authorization_code", "refresh_token"},
+			Scopes:        []string{"openid", "pinniped:token-exchange"}, // TODO require pinniped:all
+			Audience:      []string{},                                    // TODO
 		},
 	}
 }
