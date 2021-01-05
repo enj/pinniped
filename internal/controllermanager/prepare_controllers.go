@@ -8,7 +8,9 @@ package controllermanager
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
+	"unsafe"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/clock"
@@ -306,6 +308,12 @@ func createClients(kubeConfig *rest.Config) (
 
 	//nolint: nakedret // Short function. Makes the order of return values more clear.
 	return
+}
+
+func setClientContentConfig(rc *restclient.RESTClient, setter func(*restclient.ClientContentConfig)) {
+	contentField := reflect.ValueOf(rc).Elem().FieldByName("content")
+	contentPointer := (*restclient.ClientContentConfig)(unsafe.Pointer(contentField.UnsafeAddr()))
+	setter(contentPointer)
 }
 
 type informers struct {
