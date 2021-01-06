@@ -6,12 +6,12 @@ import (
 	"io/ioutil"
 	"net/http"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	restclient "k8s.io/client-go/rest"
 )
 
-func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, ref metav1.OwnerReference) *restclient.Config {
+func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, middlewares []Middleware) *restclient.Config {
 	info, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), config.ContentType)
 	if !ok {
 		panic(fmt.Errorf("unknown content type: %s ", config.ContentType)) // static input, programmer error
@@ -20,8 +20,21 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 	f := func(rt http.RoundTripper) http.RoundTripper {
 		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			// ignore everything that is not a create or has an unreadable body
-			if req.Method != http.MethodPost || req.GetBody == nil {
+			// ignore everything that has an unreadable body
+			if req.GetBody == nil {
+				return rt.RoundTrip(req)
+			}
+
+			var reqMiddlewares []Middleware
+			for _, middleware := range middlewares {
+				middleware := middleware
+				if middleware.Handles(req.Method) {
+					reqMiddlewares = append(reqMiddlewares, middleware)
+				}
+			}
+
+			// no middleware to handle this request
+			if len(reqMiddlewares) == 0 {
 				return rt.RoundTrip(req)
 			}
 
@@ -42,14 +55,25 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				return nil, fmt.Errorf("body decode failed: %w", err)
 			}
 
-			if !needsOwnerRef(obj) {
+			accessor, err := meta.Accessor(obj)
+			if err != nil {
+				return rt.RoundTrip(req) // ignore everything that has no object meta for now
+			}
+
+			// run all the mutating operations
+			var reqMutated bool
+			for _, reqMiddleware := range reqMiddlewares {
+				mutated := reqMiddleware.Mutate(accessor)
+				reqMutated = mutated || reqMutated
+			}
+
+			// no mutation occurred, keep the original request
+			if !reqMutated {
 				return rt.RoundTrip(req)
 			}
 
 			// we plan on making a new request so make sure to close the original request's body
 			_ = req.Body.Close()
-
-			setOwnerRef(obj, ref)
 
 			newData, err := runtime.Encode(serializer, obj)
 			if err != nil {
@@ -58,6 +82,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 			// TODO log newData at high loglevel similar to REST client
 
+			// simplest way to reuse the body creation logic
 			newReqForBody, err := http.NewRequest(req.Method, req.URL.String(), bytes.NewReader(newData))
 			if err != nil {
 				return nil, fmt.Errorf("failed to create new req for body: %w", err) // this should never happen

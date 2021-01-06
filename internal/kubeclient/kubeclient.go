@@ -21,8 +21,15 @@ type Client struct {
 	Pinniped    pinnipedclientset.Interface
 }
 
-func New(ref metav1.OwnerReference) (*Client, error) {
+// TODO expand this interface to address more complex use cases
+type Middleware interface {
+	Handles(httpMethod string) bool
+	Mutate(obj metav1.Object) (mutated bool)
+}
+
+func New(middlewares ...Middleware) (*Client, error) {
 	// assume we are always running in a pod with the service account token mounted
+	// TODO make this configurable
 	kubeConfig, err := restclient.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
@@ -35,13 +42,13 @@ func New(ref metav1.OwnerReference) (*Client, error) {
 	protoKubeConfig := createProtoKubeConfig(kubeConfig)
 
 	// Connect to the core Kubernetes API.
-	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, ref))
+	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
 	}
 
 	// Connect to the Kubernetes aggregation API.
-	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, ref))
+	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize aggregation client: %w", err)
 	}
@@ -49,7 +56,7 @@ func New(ref metav1.OwnerReference) (*Client, error) {
 	// Connect to the pinniped API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, ref))
+	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
