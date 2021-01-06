@@ -28,6 +28,9 @@ func New(ref metav1.OwnerReference) (*Client, error) {
 		return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
 	}
 
+	// explicitly use json when talking to CRD APIs
+	jsonKubeConfig := createJSONKubeConfig(kubeConfig)
+
 	// explicitly use protobuf when talking to built-in kube APIs
 	protoKubeConfig := createProtoKubeConfig(kubeConfig)
 
@@ -46,7 +49,7 @@ func New(ref metav1.OwnerReference) (*Client, error) {
 	// Connect to the pinniped API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(kubeConfig, pinnipedclientsetscheme.Codecs, ref))
+	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, ref))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
@@ -56,6 +59,15 @@ func New(ref metav1.OwnerReference) (*Client, error) {
 		Aggregation: aggregatorClient,
 		Pinniped:    pinnipedClient,
 	}, nil
+}
+
+// Returns a copy of the input config with the ContentConfig set to use json.
+// Use this config to communicate with all CRD based APIs.
+func createJSONKubeConfig(kubeConfig *restclient.Config) *restclient.Config {
+	jsonKubeConfig := restclient.CopyConfig(kubeConfig)
+	jsonKubeConfig.AcceptContentTypes = runtime.ContentTypeJSON
+	jsonKubeConfig.ContentType = runtime.ContentTypeJSON
+	return jsonKubeConfig
 }
 
 // Returns a copy of the input config with the ContentConfig set to use protobuf.
