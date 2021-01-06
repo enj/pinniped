@@ -4,20 +4,19 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
-	"mime"
 	"net/http"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
 )
 
-func configWithWrapper(config *restclient.Config, codecs serializer.CodecFactory, ref metav1.OwnerReference) *restclient.Config {
-	negotiatedSerializer := codecs.WithoutConversion()
-	resolver := server.NewRequestInfoResolver(server.NewConfig(codecs))
+func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, ref metav1.OwnerReference) *restclient.Config {
+	info, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), config.ContentType)
+	if !ok {
+		panic("TODO")
+	}
+	serializer := info.Serializer
 
 	f := func(rt http.RoundTripper) http.RoundTripper {
 		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -36,16 +35,7 @@ func configWithWrapper(config *restclient.Config, codecs serializer.CodecFactory
 				return nil, fmt.Errorf("read body failed: %w", err)
 			}
 
-			requestInfo, e8 := resolver.NewRequestInfo(req)
-
-			gv := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-			negotiator := runtime.NewClientNegotiator(negotiatedSerializer, gv)
-
-			contentType := req.Header.Get("Content-Type")
-			mediaType, params, e1 := mime.ParseMediaType(contentType)
-
-			decoder, e2 := negotiator.Decoder(mediaType, params)
-			obj, _, e3 := decoder.Decode(data, nil, nil)
+			obj, _, e3 := serializer.Decode(data, nil, nil)
 
 			if !needsOwnerRef(obj) {
 				return rt.RoundTrip(req)
@@ -55,16 +45,17 @@ func configWithWrapper(config *restclient.Config, codecs serializer.CodecFactory
 
 			setOwnerRef(obj, ref)
 
-			encoder, e6 := negotiator.Encoder(mediaType, params)
-
-			newData, e7 := runtime.Encode(encoder, obj)
+			newData, e7 := runtime.Encode(serializer, obj)
 
 			// TODO log newData at high loglevel
 
-			newReqForBody, e4 := http.NewRequestWithContext(req.Context(), req.Method, req.URL.String(), bytes.NewReader(newData))
+			newReqForBody, e4 := http.NewRequest(req.Method, req.URL.String(), bytes.NewReader(newData))
 
-			// we want to preserve all the headers and such
-			newReq := req.Clone(req.Context())
+			// we want to preserve all the headers and such but not mutate the original request
+			newReq := req.WithContext(req.Context())
+
+			// replace the body with the new data
+			newReq.ContentLength = newReqForBody.ContentLength
 			newReq.Body = newReqForBody.Body
 			newReq.GetBody = newReqForBody.GetBody
 
