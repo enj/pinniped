@@ -13,7 +13,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiregistrationv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
 
+	conciergeconfigv1alpha1 "go.pinniped.dev/generated/1.19/apis/concierge/config/v1alpha1"
+	supervisorconfigv1alpha1 "go.pinniped.dev/generated/1.19/apis/supervisor/config/v1alpha1"
 	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/ownerref"
 	"go.pinniped.dev/test/library"
@@ -87,8 +90,7 @@ func TestKubeClientOwnerRef(t *testing.T) {
 		metav1.CreateOptions{},
 	)
 	require.NoError(t, err)
-	require.Len(t, childSecret.OwnerReferences, 1)
-	require.Equal(t, ref, childSecret.OwnerReferences[0])
+	hasOwnerRef(t, childSecret, ref)
 
 	preexistingRef := *ref.DeepCopy()
 	preexistingRef.Name = "different"
@@ -107,9 +109,13 @@ func TestKubeClientOwnerRef(t *testing.T) {
 		metav1.CreateOptions{},
 	)
 	require.NoError(t, err)
-	require.Len(t, otherSecret.OwnerReferences, 1)
-	require.Equal(t, preexistingRef, otherSecret.OwnerReferences[0])
+	hasOwnerRef(t, otherSecret, preexistingRef)
 	require.NotEqual(t, ref, preexistingRef)
+	// the secret has no owner so it should be immediately deleted
+	isEventuallyDeleted(t, func() error {
+		_, err := ownerRefSecrets.Get(ctx, otherSecret.Name, metav1.GetOptions{})
+		return err
+	})
 
 	// we expect no owner ref to be set on update
 	parentSecretUpdate := parentSecret.DeepCopy()
@@ -125,20 +131,79 @@ func TestKubeClientOwnerRef(t *testing.T) {
 	require.NoError(t, err)
 
 	// the child object should be cleaned up on its own
-	require.Eventually(t, func() bool {
+	isEventuallyDeleted(t, func() error {
 		_, err := ownerRefSecrets.Get(ctx, childSecret.Name, metav1.GetOptions{})
-		switch {
-		case err == nil:
-			return false
-		case errors.IsNotFound(err):
-			return true
-		default:
-			require.NoError(t, err)
-			return false
-		}
-	}, time.Minute, time.Second)
+		return err
+	})
 
-	// TODO use aggregation and pinniped client x2
+	// sanity check API service client
+	apiService, err := ownerRefClient.Aggregation.ApiregistrationV1().APIServices().Create(
+		ctx,
+		&apiregistrationv1.APIService{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "v1.pandas.dev",
+				OwnerReferences: nil, // no owner refs set
+			},
+			Spec: apiregistrationv1.APIServiceSpec{
+				Version:              "v1",
+				Group:                "pandas.dev",
+				GroupPriorityMinimum: 10_000,
+				VersionPriority:      500,
+			},
+		},
+		metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	hasOwnerRef(t, apiService, ref)
+	// this owner ref is invalid for an API service so it should be immediately deleted
+	isEventuallyDeleted(t, func() error {
+		_, err := ownerRefClient.Aggregation.ApiregistrationV1().APIServices().Get(ctx, apiService.Name, metav1.GetOptions{})
+		return err
+	})
+
+	// sanity check concierge client
+	credentialIssuer, err := ownerRefClient.PinnipedConcierge.ConfigV1alpha1().CredentialIssuers(namespace.Name).Create(
+		ctx,
+		&conciergeconfigv1alpha1.CredentialIssuer{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName:    "owner-ref-test-",
+				OwnerReferences: nil, // no owner refs set
+			},
+			Status: conciergeconfigv1alpha1.CredentialIssuerStatus{
+				Strategies: []conciergeconfigv1alpha1.CredentialIssuerStrategy{},
+			},
+		},
+		metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	hasOwnerRef(t, credentialIssuer, ref)
+	// this owner has already been deleted so the cred issuer should be immediately deleted
+	isEventuallyDeleted(t, func() error {
+		_, err := ownerRefClient.PinnipedConcierge.ConfigV1alpha1().CredentialIssuers(namespace.Name).Get(ctx, credentialIssuer.Name, metav1.GetOptions{})
+		return err
+	})
+
+	// sanity check supervisor client
+	federationDomain, err := ownerRefClient.PinnipedSupervisor.ConfigV1alpha1().FederationDomains(namespace.Name).Create(
+		ctx,
+		&supervisorconfigv1alpha1.FederationDomain{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName:    "owner-ref-test-",
+				OwnerReferences: nil, // no owner refs set
+			},
+			Spec: supervisorconfigv1alpha1.FederationDomainSpec{
+				Issuer: "https://pandas.dev",
+			},
+		},
+		metav1.CreateOptions{},
+	)
+	require.NoError(t, err)
+	hasOwnerRef(t, federationDomain, ref)
+	// this owner has already been deleted so the federation domain should be immediately deleted
+	isEventuallyDeleted(t, func() error {
+		_, err := ownerRefClient.PinnipedSupervisor.ConfigV1alpha1().FederationDomains(namespace.Name).Get(ctx, federationDomain.Name, metav1.GetOptions{})
+		return err
+	})
 
 	// check some well-known, always created secrets to make sure they have an owner ref back to their deployment
 
@@ -154,8 +219,7 @@ func TestKubeClientOwnerRef(t *testing.T) {
 	supervisorDref := *dref.DeepCopy()
 	supervisorDref.Name = env.SupervisorAppName
 	supervisorDref.UID = supervisorDeployment.UID
-	require.Len(t, supervisorKey.OwnerReferences, 1)
-	require.Equal(t, supervisorDref, supervisorKey.OwnerReferences[0])
+	hasOwnerRef(t, supervisorKey, supervisorDref)
 
 	conciergeDeployment, err := ownerRefClient.Kubernetes.AppsV1().Deployments(env.ConciergeNamespace).Get(ctx, env.ConciergeAppName, metav1.GetOptions{})
 	require.NoError(t, err)
@@ -166,6 +230,30 @@ func TestKubeClientOwnerRef(t *testing.T) {
 	conciergeDref := *dref.DeepCopy()
 	conciergeDref.Name = env.ConciergeAppName
 	conciergeDref.UID = conciergeDeployment.UID
-	require.Len(t, conciergeCert.OwnerReferences, 1)
-	require.Equal(t, conciergeDref, conciergeCert.OwnerReferences[0])
+	hasOwnerRef(t, conciergeCert, conciergeDref)
+}
+
+func hasOwnerRef(t *testing.T, obj metav1.Object, ref metav1.OwnerReference) {
+	t.Helper()
+
+	ownerReferences := obj.GetOwnerReferences()
+	require.Len(t, ownerReferences, 1)
+	require.Equal(t, ref, ownerReferences[0])
+}
+
+func isEventuallyDeleted(t *testing.T, f func() error) {
+	t.Helper()
+
+	require.Eventually(t, func() bool {
+		err := f()
+		switch {
+		case err == nil:
+			return false
+		case errors.IsNotFound(err):
+			return true
+		default:
+			require.NoError(t, err)
+			return false
+		}
+	}, time.Minute, time.Second)
 }
