@@ -17,7 +17,7 @@ var _ kubeclient.Middleware = ownerRefMiddleware(metav1.OwnerReference{})
 type ownerRefMiddleware metav1.OwnerReference
 
 func (o ownerRefMiddleware) Handles(httpMethod string) bool {
-	return httpMethod == http.MethodPost
+	return httpMethod == http.MethodPost // only handle create requests
 }
 
 // TODO this func assumes all objects are namespace scoped and are in the same namespace
@@ -26,10 +26,8 @@ func (o ownerRefMiddleware) Handles(httpMethod string) bool {
 //  this could be fixed by using a rest mapper to confirm the REST scoping
 //  or we could always use an owner ref to a cluster scoped object
 func (o ownerRefMiddleware) Mutate(obj metav1.Object) (mutated bool) {
-	// ignore objects that already have a creation timestamp, i.e. on update
 	// we only want to set the owner ref on create and when one is not already present
-	needsOwnerRef := obj.GetCreationTimestamp().IsZero() && len(obj.GetOwnerReferences()) == 0
-	if !needsOwnerRef {
+	if len(obj.GetOwnerReferences()) != 0 {
 		return false
 	}
 
