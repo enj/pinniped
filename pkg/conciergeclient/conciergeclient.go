@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strings"
 
-	"go.pinniped.dev/internal/kubeclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
@@ -23,6 +22,7 @@ import (
 	loginv1alpha1 "go.pinniped.dev/generated/1.19/apis/concierge/login/v1alpha1"
 	conciergeclientset "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
 	"go.pinniped.dev/internal/constable"
+	"go.pinniped.dev/internal/kubeclient"
 )
 
 // ErrLoginFailed is returned by Client.ExchangeToken when the concierge server rejects the login request for any reason.

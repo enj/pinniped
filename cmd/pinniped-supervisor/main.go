@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"go.pinniped.dev/internal/deploymentref"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/clock"
@@ -36,6 +35,7 @@ import (
 	"go.pinniped.dev/internal/controller/supervisorconfig/upstreamwatcher"
 	"go.pinniped.dev/internal/controller/supervisorstorage"
 	"go.pinniped.dev/internal/controllerlib"
+	"go.pinniped.dev/internal/deploymentref"
 	"go.pinniped.dev/internal/downward"
 	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/oidc/jwks"

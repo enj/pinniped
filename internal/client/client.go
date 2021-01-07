@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 
-	"go.pinniped.dev/internal/kubeclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
@@ -18,6 +17,7 @@ import (
 
 	"go.pinniped.dev/generated/1.19/apis/concierge/login/v1alpha1"
 	"go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
+	"go.pinniped.dev/internal/kubeclient"
 )
 
 // ErrLoginFailed is returned by ExchangeToken when the server rejects the login request.

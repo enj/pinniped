@@ -1,3 +1,6 @@
+// Copyright 2021 the Pinniped contributors. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package kubeclient
 
 import (
@@ -23,10 +26,10 @@ type Client struct {
 	PinnipedConcierge  pinnipedconciergeclientset.Interface
 	PinnipedSupervisor pinnipedsupervisorclientset.Interface
 
-	JsonConfig, ProtoConfig *restclient.Config
+	JSONConfig, ProtoConfig *restclient.Config
 }
 
-// TODO expand this interface to address more complex use cases
+// TODO expand this interface to address more complex use cases.
 type Middleware interface {
 	Handles(httpMethod string) bool
 	Mutate(obj metav1.Object) (mutated bool)
@@ -89,7 +92,7 @@ func New(opts ...Option) (*Client, error) {
 		PinnipedConcierge:  pinnipedConciergeClient,
 		PinnipedSupervisor: pinnipedSupervisorClient,
 
-		JsonConfig:  jsonKubeConfig,
+		JSONConfig:  jsonKubeConfig,
 		ProtoConfig: protoKubeConfig,
 	}, nil
 }

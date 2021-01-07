@@ -10,9 +10,6 @@ import (
 	"fmt"
 	"time"
 
-	"go.pinniped.dev/internal/deploymentref"
-	"go.pinniped.dev/internal/downward"
-	"go.pinniped.dev/internal/kubeclient"
 	"k8s.io/apimachinery/pkg/util/clock"
 	k8sinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -30,7 +27,10 @@ import (
 	"go.pinniped.dev/internal/controller/issuerconfig"
 	"go.pinniped.dev/internal/controller/kubecertagent"
 	"go.pinniped.dev/internal/controllerlib"
+	"go.pinniped.dev/internal/deploymentref"
+	"go.pinniped.dev/internal/downward"
 	"go.pinniped.dev/internal/dynamiccert"
+	"go.pinniped.dev/internal/kubeclient"
 )
 
 const (
@@ -208,7 +208,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 			kubecertagent.NewExecerController(
 				credentialIssuerLocationConfig,
 				c.DynamicSigningCertProvider,
-				kubecertagent.NewPodCommandExecutor(client.JsonConfig, client.Kubernetes),
+				kubecertagent.NewPodCommandExecutor(client.JSONConfig, client.Kubernetes),
 				client.PinnipedConcierge,
 				clock.RealClock{},
 				informers.installationNamespaceK8s.Core().V1().Pods(),

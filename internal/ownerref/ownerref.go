@@ -1,3 +1,6 @@
+// Copyright 2021 the Pinniped contributors. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 package ownerref
 
 import (
@@ -22,7 +25,7 @@ func (o ownerRefMiddleware) Handles(httpMethod string) bool {
 	return httpMethod == http.MethodPost // only handle create requests
 }
 
-// TODO this func assumes all objects are namespace scoped and are in the same namespace
+// TODO this func assumes all objects are namespace scoped and are in the same namespace.
 //  i.e. it assumes all objects are safe to set an owner ref on
 //  i.e. the owner could be namespace scoped and thus cannot own a cluster scoped object
 //  this could be fixed by using a rest mapper to confirm the REST scoping

@@ -17,7 +17,6 @@ import (
 
 	"github.com/coreos/go-oidc"
 	"github.com/spf13/cobra"
-	"go.pinniped.dev/internal/kubeclient"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,6 +26,7 @@ import (
 
 	conciergev1alpha1 "go.pinniped.dev/generated/1.19/apis/concierge/authentication/v1alpha1"
 	conciergeclientset "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
+	"go.pinniped.dev/internal/kubeclient"
 )
 
 type kubeconfigDeps struct {
