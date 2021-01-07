@@ -27,28 +27,36 @@ type Middleware interface {
 	Mutate(obj metav1.Object) (mutated bool)
 }
 
-func New(middlewares ...Middleware) (*Client, error) {
-	// assume we are always running in a pod with the service account token mounted
-	// TODO make this configurable
-	kubeConfig, err := restclient.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
+func New(opts ...Option) (*Client, error) {
+	c := &clientConfig{}
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	// default to assuming we are running in a pod with the service account token mounted
+	if c.config == nil {
+		inClusterConfig, err := restclient.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
+		}
+		WithConfig(inClusterConfig)(c) // make sure all writes to clientConfig flow through one code path
 	}
 
 	// explicitly use json when talking to CRD APIs
-	jsonKubeConfig := createJSONKubeConfig(kubeConfig)
+	jsonKubeConfig := createJSONKubeConfig(c.config)
 
 	// explicitly use protobuf when talking to built-in kube APIs
-	protoKubeConfig := createProtoKubeConfig(kubeConfig)
+	protoKubeConfig := createProtoKubeConfig(c.config)
 
 	// Connect to the core Kubernetes API.
-	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, middlewares))
+	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
 	}
 
 	// Connect to the Kubernetes aggregation API.
-	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, middlewares))
+	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize aggregation client: %w", err)
 	}
@@ -56,7 +64,7 @@ func New(middlewares ...Middleware) (*Client, error) {
 	// Connect to the pinniped API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, middlewares))
+	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}

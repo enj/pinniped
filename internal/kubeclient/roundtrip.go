@@ -11,7 +11,14 @@ import (
 	restclient "k8s.io/client-go/rest"
 )
 
+// TODO unit test
+
 func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, middlewares []Middleware) *restclient.Config {
+	// no need for any wrapping when we have no middleware to inject
+	if len(middlewares) == 0 {
+		return config
+	}
+
 	info, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), config.ContentType)
 	if !ok {
 		panic(fmt.Errorf("unknown content type: %s ", config.ContentType)) // static input, programmer error

@@ -8,6 +8,8 @@ import (
 	"go.pinniped.dev/internal/kubeclient"
 )
 
+// TODO unit test
+
 func New(ref metav1.OwnerReference) kubeclient.Middleware {
 	return ownerRefMiddleware(ref)
 }
