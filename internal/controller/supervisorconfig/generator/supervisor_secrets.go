@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
@@ -200,14 +199,7 @@ func generateSecret(namespace, name string, labels map[string]string, secretData
 		return nil, err
 	}
 
-	deploymentGVK := schema.GroupVersionKind{
-		Group:   appsv1.SchemeGroupVersion.Group,
-		Version: appsv1.SchemeGroupVersion.Version,
-		Kind:    "Deployment",
-	}
-
-	blockOwnerDeletion := true
-	isController := false
+	deploymentGVK := appsv1.SchemeGroupVersion.WithKind("Deployment")
 
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -215,12 +207,10 @@ func generateSecret(namespace, name string, labels map[string]string, secretData
 			Namespace: namespace,
 			OwnerReferences: []metav1.OwnerReference{
 				{
-					APIVersion:         deploymentGVK.GroupVersion().String(),
-					Kind:               deploymentGVK.Kind,
-					Name:               owner.GetName(),
-					UID:                owner.GetUID(),
-					BlockOwnerDeletion: &blockOwnerDeletion,
-					Controller:         &isController,
+					APIVersion: deploymentGVK.GroupVersion().String(),
+					Kind:       deploymentGVK.Kind,
+					Name:       owner.GetName(),
+					UID:        owner.GetUID(),
 				},
 			},
 			Labels: labels,

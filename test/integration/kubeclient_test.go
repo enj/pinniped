@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -19,7 +20,7 @@ import (
 )
 
 func TestKubeClientOwnerRef(t *testing.T) {
-	library.SkipUnlessIntegration(t)
+	env := library.IntegrationEnv(t)
 
 	regularClient := library.NewClientset(t)
 
@@ -138,5 +139,33 @@ func TestKubeClientOwnerRef(t *testing.T) {
 	}, time.Minute, time.Second)
 
 	// TODO use aggregation and pinniped client x2
-	t.Error(library.Sdump(childSecret))
+
+	// check some well-known, always created secrets to make sure they have an owner ref back to their deployment
+
+	dref := metav1.OwnerReference{}
+	dref.APIVersion, dref.Kind = appsv1.SchemeGroupVersion.WithKind("Deployment").ToAPIVersionAndKind()
+
+	supervisorDeployment, err := ownerRefClient.Kubernetes.AppsV1().Deployments(env.SupervisorNamespace).Get(ctx, env.SupervisorAppName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	supervisorKey, err := ownerRefClient.Kubernetes.CoreV1().Secrets(env.SupervisorNamespace).Get(ctx, env.SupervisorAppName+"-key", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	supervisorDref := *dref.DeepCopy()
+	supervisorDref.Name = env.SupervisorAppName
+	supervisorDref.UID = supervisorDeployment.UID
+	require.Len(t, supervisorKey.OwnerReferences, 1)
+	require.Equal(t, supervisorDref, supervisorKey.OwnerReferences[0])
+
+	conciergeDeployment, err := ownerRefClient.Kubernetes.AppsV1().Deployments(env.ConciergeNamespace).Get(ctx, env.ConciergeAppName, metav1.GetOptions{})
+	require.NoError(t, err)
+
+	conciergeCert, err := ownerRefClient.Kubernetes.CoreV1().Secrets(env.ConciergeNamespace).Get(ctx, env.ConciergeAppName+"-api-tls-serving-certificate", metav1.GetOptions{})
+	require.NoError(t, err)
+
+	conciergeDref := *dref.DeepCopy()
+	conciergeDref.Name = env.ConciergeAppName
+	conciergeDref.UID = conciergeDeployment.UID
+	require.Len(t, conciergeCert.OwnerReferences, 1)
+	require.Equal(t, conciergeDref, conciergeCert.OwnerReferences[0])
 }

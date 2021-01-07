@@ -32,7 +32,6 @@ type Middleware interface {
 	Mutate(obj metav1.Object) (mutated bool)
 }
 
-// TODO actually make callers of this function set owner refs
 func New(opts ...Option) (*Client, error) {
 	c := &clientConfig{}
 

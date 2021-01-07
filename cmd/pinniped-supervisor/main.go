@@ -15,9 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"go.pinniped.dev/internal/deploymentref"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/clock"
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -252,48 +252,19 @@ func startControllers(
 	go controllerManager.Start(ctx)
 }
 
-func getSupervisorDeployment(
-	ctx context.Context,
-	kubeClient kubernetes.Interface,
-	podInfo *downward.PodInfo,
-) (*appsv1.Deployment, error) {
-	ns := podInfo.Namespace
-
-	pod, err := kubeClient.CoreV1().Pods(ns).Get(ctx, podInfo.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not get pod: %w", err)
-	}
-
-	podOwner := metav1.GetControllerOf(pod)
-	if podOwner == nil {
-		return nil, fmt.Errorf("pod %s/%s is missing owner", ns, podInfo.Name)
-	}
-
-	rs, err := kubeClient.AppsV1().ReplicaSets(ns).Get(ctx, podOwner.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not get replicaset: %w", err)
-	}
-
-	rsOwner := metav1.GetControllerOf(rs)
-	if rsOwner == nil {
-		return nil, fmt.Errorf("replicaset %s/%s is missing owner", ns, podInfo.Name)
-	}
-
-	d, err := kubeClient.AppsV1().Deployments(ns).Get(ctx, rsOwner.Name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("could not get deployment: %w", err)
-	}
-
-	return d, nil
-}
-
 func run(podInfo *downward.PodInfo, cfg *supervisor.Config) error {
 	serverInstallationNamespace := podInfo.Namespace
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client, err := kubeclient.New()
+	// TODO remove code that relies on supervisorDeployment directly
+	dref, supervisorDeployment, err := deploymentref.New(ctx, podInfo)
+	if err != nil {
+		return fmt.Errorf("cannot create deployment ref: %w", err)
+	}
+
+	client, err := kubeclient.New(dref)
 	if err != nil {
 		return fmt.Errorf("cannot create k8s client: %w", err)
 	}
@@ -329,11 +300,6 @@ func run(podInfo *downward.PodInfo, cfg *supervisor.Config) error {
 		&secretCache,
 		client.Kubernetes.CoreV1().Secrets(serverInstallationNamespace),
 	)
-
-	supervisorDeployment, err := getSupervisorDeployment(ctx, client.Kubernetes, podInfo)
-	if err != nil {
-		return fmt.Errorf("cannot get supervisor deployment: %w", err)
-	}
 
 	startControllers(
 		ctx,
