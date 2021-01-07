@@ -10,14 +10,11 @@ import (
 	"fmt"
 	"time"
 
-	"k8s.io/apimachinery/pkg/runtime"
+	"go.pinniped.dev/internal/kubeclient"
 	"k8s.io/apimachinery/pkg/util/clock"
 	k8sinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	restclient "k8s.io/client-go/rest"
 	"k8s.io/klog/v2/klogr"
-	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 
 	loginv1alpha1 "go.pinniped.dev/generated/1.19/apis/concierge/login/v1alpha1"
 	pinnipedclientset "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
@@ -81,18 +78,13 @@ type Config struct {
 // Prepare the controllers and their informers and return a function that will start them when called.
 //nolint:funlen // Eh, fair, it is a really long function...but it is wiring the world...so...
 func PrepareControllers(c *Config) (func(ctx context.Context), error) {
-	// Create k8s clients.
-	kubeConfig, err := createConfig()
-	if err != nil {
-		return nil, fmt.Errorf("could not create config for the controllers: %w", err)
-	}
-	k8sClient, aggregatorClient, pinnipedClient, err := createClients(kubeConfig)
+	client, err := kubeclient.New()
 	if err != nil {
 		return nil, fmt.Errorf("could not create clients for the controllers: %w", err)
 	}
 
 	// Create informers. Don't forget to make sure they get started in the function returned below.
-	informers := createInformers(c.ServerInstallationNamespace, k8sClient, pinnipedClient)
+	informers := createInformers(c.ServerInstallationNamespace, client.Kubernetes, client.PinnipedConcierge)
 
 	// Configuration for the kubecertagent controllers created below.
 	agentPodConfig := &kubecertagent.AgentPodConfig{
@@ -119,7 +111,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				c.NamesConfig.CredentialIssuer,
 				c.Labels,
 				c.DiscoveryURLOverride,
-				pinnipedClient,
+				client.PinnipedConcierge,
 				informers.kubePublicNamespaceK8s.Core().V1().ConfigMaps(),
 				controllerlib.WithInformer,
 			),
@@ -132,7 +124,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				c.ServerInstallationNamespace,
 				c.NamesConfig.ServingCertificateSecret,
 				c.Labels,
-				k8sClient,
+				client.Kubernetes,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
 				controllerlib.WithInformer,
 				controllerlib.WithInitialEvent,
@@ -147,7 +139,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				c.ServerInstallationNamespace,
 				c.NamesConfig.ServingCertificateSecret,
 				loginv1alpha1.SchemeGroupVersion.Version+"."+loginv1alpha1.GroupName,
-				aggregatorClient,
+				client.Aggregation,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
 				controllerlib.WithInformer,
 			),
@@ -167,7 +159,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 			apicerts.NewCertsExpirerController(
 				c.ServerInstallationNamespace,
 				c.NamesConfig.ServingCertificateSecret,
-				k8sClient,
+				client.Kubernetes,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
 				controllerlib.WithInformer,
 				c.ServingCertRenewBefore,
@@ -183,8 +175,8 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				credentialIssuerLocationConfig,
 				c.Labels,
 				clock.RealClock{},
-				k8sClient,
-				pinnipedClient,
+				client.Kubernetes,
+				client.PinnipedConcierge,
 				informers.kubeSystemNamespaceK8s.Core().V1().Pods(),
 				informers.installationNamespaceK8s.Core().V1().Pods(),
 				controllerlib.WithInformer,
@@ -197,8 +189,8 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				agentPodConfig,
 				credentialIssuerLocationConfig,
 				clock.RealClock{},
-				k8sClient,
-				pinnipedClient,
+				client.Kubernetes,
+				client.PinnipedConcierge,
 				informers.kubeSystemNamespaceK8s.Core().V1().Pods(),
 				informers.installationNamespaceK8s.Core().V1().Pods(),
 				controllerlib.WithInformer,
@@ -209,8 +201,8 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 			kubecertagent.NewExecerController(
 				credentialIssuerLocationConfig,
 				c.DynamicSigningCertProvider,
-				kubecertagent.NewPodCommandExecutor(kubeConfig, k8sClient),
-				pinnipedClient,
+				kubecertagent.NewPodCommandExecutor(client.JsonConfig, client.Kubernetes),
+				client.PinnipedConcierge,
 				clock.RealClock{},
 				informers.installationNamespaceK8s.Core().V1().Pods(),
 				controllerlib.WithInformer,
@@ -220,7 +212,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		WithController(
 			kubecertagent.NewDeleterController(
 				agentPodConfig,
-				k8sClient,
+				client.Kubernetes,
 				informers.kubeSystemNamespaceK8s.Core().V1().Pods(),
 				informers.installationNamespaceK8s.Core().V1().Pods(),
 				controllerlib.WithInformer,
@@ -263,51 +255,6 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 	}, nil
 }
 
-// Create the rest config that will be used by the clients for the controllers.
-func createConfig() (*rest.Config, error) {
-	// Load the Kubernetes client configuration.
-	kubeConfig, err := restclient.InClusterConfig()
-	if err != nil {
-		return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
-	}
-
-	return kubeConfig, nil
-}
-
-// Create the k8s clients that will be used by the controllers.
-func createClients(kubeConfig *rest.Config) (
-	k8sClient *kubernetes.Clientset,
-	aggregatorClient *aggregatorclient.Clientset,
-	pinnipedClient *pinnipedclientset.Clientset,
-	err error,
-) {
-	// explicitly use protobuf when talking to built-in kube APIs
-	protoKubeConfig := createProtoKubeConfig(kubeConfig)
-
-	// Connect to the core Kubernetes API.
-	k8sClient, err = kubernetes.NewForConfig(protoKubeConfig)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
-	}
-
-	// Connect to the Kubernetes aggregation API.
-	aggregatorClient, err = aggregatorclient.NewForConfig(protoKubeConfig)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
-	}
-
-	// Connect to the pinniped API.
-	// I think we can't use protobuf encoding here because we are using CRDs
-	// (for which protobuf encoding is not supported).
-	pinnipedClient, err = pinnipedclientset.NewForConfig(kubeConfig)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("could not initialize pinniped client: %w", err)
-	}
-
-	//nolint: nakedret // Short function. Makes the order of return values more clear.
-	return
-}
-
 type informers struct {
 	kubePublicNamespaceK8s        k8sinformers.SharedInformerFactory
 	kubeSystemNamespaceK8s        k8sinformers.SharedInformerFactory
@@ -318,8 +265,8 @@ type informers struct {
 // Create the informers that will be used by the controllers.
 func createInformers(
 	serverInstallationNamespace string,
-	k8sClient *kubernetes.Clientset,
-	pinnipedClient *pinnipedclientset.Clientset,
+	k8sClient kubernetes.Interface,
+	pinnipedClient pinnipedclientset.Interface,
 ) *informers {
 	return &informers{
 		kubePublicNamespaceK8s: k8sinformers.NewSharedInformerFactoryWithOptions(
@@ -355,14 +302,4 @@ func (i *informers) startAndWaitForSync(ctx context.Context) {
 	i.kubeSystemNamespaceK8s.WaitForCacheSync(ctx.Done())
 	i.installationNamespaceK8s.WaitForCacheSync(ctx.Done())
 	i.installationNamespacePinniped.WaitForCacheSync(ctx.Done())
-}
-
-// Returns a copy of the input config with the ContentConfig set to use protobuf.
-// Do not use this config to communicate with any CRD based APIs.
-func createProtoKubeConfig(kubeConfig *restclient.Config) *restclient.Config {
-	protoKubeConfig := restclient.CopyConfig(kubeConfig)
-	const protoThenJSON = runtime.ContentTypeProtobuf + "," + runtime.ContentTypeJSON
-	protoKubeConfig.AcceptContentTypes = protoThenJSON
-	protoKubeConfig.ContentType = runtime.ContentTypeProtobuf
-	return protoKubeConfig
 }

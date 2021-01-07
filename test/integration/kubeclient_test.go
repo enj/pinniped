@@ -137,6 +137,6 @@ func TestKubeClientOwnerRef(t *testing.T) {
 		}
 	}, time.Minute, time.Second)
 
-	// TODO use aggregation and pinniped client
+	// TODO use aggregation and pinniped client x2
 	t.Error(library.Sdump(childSecret))
 }

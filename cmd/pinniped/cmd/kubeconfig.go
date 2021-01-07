@@ -17,6 +17,7 @@ import (
 
 	"github.com/coreos/go-oidc"
 	"github.com/spf13/cobra"
+	"go.pinniped.dev/internal/kubeclient"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
 	"k8s.io/client-go/tools/clientcmd"
@@ -41,7 +42,11 @@ func kubeconfigRealDeps() kubeconfigDeps {
 			if err != nil {
 				return nil, err
 			}
-			return conciergeclientset.NewForConfig(restConfig)
+			client, err := kubeclient.New(kubeclient.WithConfig(restConfig))
+			if err != nil {
+				return nil, err
+			}
+			return client.PinnipedConcierge, nil
 		},
 	}
 }

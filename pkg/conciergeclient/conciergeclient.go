@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 
+	"go.pinniped.dev/internal/kubeclient"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clientauthenticationv1beta1 "k8s.io/client-go/pkg/apis/clientauthentication/v1beta1"
@@ -150,7 +151,11 @@ func (c *Client) clientset() (conciergeclientset.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
-	return conciergeclientset.NewForConfig(cfg)
+	client, err := kubeclient.New(kubeclient.WithConfig(cfg))
+	if err != nil {
+		return nil, err
+	}
+	return client.PinnipedConcierge, nil
 }
 
 // ExchangeToken performs a TokenCredentialRequest against the Pinniped concierge and returns the result as an ExecCredential.

@@ -11,14 +11,19 @@ import (
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	aggregatorclientscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
 
-	pinnipedclientset "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
-	pinnipedclientsetscheme "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned/scheme"
+	pinnipedconciergeclientset "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned"
+	pinnipedconciergeclientsetscheme "go.pinniped.dev/generated/1.19/client/concierge/clientset/versioned/scheme"
+	pinnipedsupervisorclientset "go.pinniped.dev/generated/1.19/client/supervisor/clientset/versioned"
+	pinnipedsupervisorclientsetscheme "go.pinniped.dev/generated/1.19/client/supervisor/clientset/versioned/scheme"
 )
 
 type Client struct {
-	Kubernetes  kubernetes.Interface
-	Aggregation aggregatorclient.Interface
-	Pinniped    pinnipedclientset.Interface
+	Kubernetes         kubernetes.Interface
+	Aggregation        aggregatorclient.Interface
+	PinnipedConcierge  pinnipedconciergeclientset.Interface
+	PinnipedSupervisor pinnipedsupervisorclientset.Interface
+
+	JsonConfig, ProtoConfig *restclient.Config
 }
 
 // TODO expand this interface to address more complex use cases
@@ -27,6 +32,7 @@ type Middleware interface {
 	Mutate(obj metav1.Object) (mutated bool)
 }
 
+// TODO actually make callers of this function set owner refs
 func New(opts ...Option) (*Client, error) {
 	c := &clientConfig{}
 
@@ -61,18 +67,31 @@ func New(opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("could not initialize aggregation client: %w", err)
 	}
 
-	// Connect to the pinniped API.
+	// Connect to the pinniped concierge API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedClient, err := pinnipedclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedclientsetscheme.Codecs, c.middlewares))
+	// TODO we should try to add protobuf support to TokenCredentialRequests since it is an aggregated API
+	pinnipedConciergeClient, err := pinnipedconciergeclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedconciergeclientsetscheme.Codecs, c.middlewares))
+	if err != nil {
+		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
+	}
+
+	// Connect to the pinniped supervisor API.
+	// We cannot use protobuf encoding here because we are using CRDs
+	// (for which protobuf encoding is not yet supported).
+	pinnipedSupervisorClient, err := pinnipedsupervisorclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedsupervisorclientsetscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
 
 	return &Client{
-		Kubernetes:  k8sClient,
-		Aggregation: aggregatorClient,
-		Pinniped:    pinnipedClient,
+		Kubernetes:         k8sClient,
+		Aggregation:        aggregatorClient,
+		PinnipedConcierge:  pinnipedConciergeClient,
+		PinnipedSupervisor: pinnipedSupervisorClient,
+
+		JsonConfig:  jsonKubeConfig,
+		ProtoConfig: protoKubeConfig,
 	}, nil
 }
 
