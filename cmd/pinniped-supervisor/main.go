@@ -259,7 +259,7 @@ func run(podInfo *downward.PodInfo, cfg *supervisor.Config) error {
 	defer cancel()
 
 	// TODO remove code that relies on supervisorDeployment directly
-	dref, supervisorDeployment, err := deploymentref.New(ctx, podInfo)
+	dref, supervisorDeployment, err := deploymentref.New(podInfo)
 	if err != nil {
 		return fmt.Errorf("cannot create deployment ref: %w", err)
 	}

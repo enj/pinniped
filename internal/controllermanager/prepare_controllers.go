@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.pinniped.dev/internal/deploymentref"
+	"go.pinniped.dev/internal/downward"
 	"go.pinniped.dev/internal/kubeclient"
 	"k8s.io/apimachinery/pkg/util/clock"
 	k8sinformers "k8s.io/client-go/informers"
@@ -40,8 +42,8 @@ const (
 //
 // It is used to inject parameters into PrepareControllers.
 type Config struct {
-	// ServerInstallationNamespace provides the namespace in which Pinniped is deployed.
-	ServerInstallationNamespace string
+	// ServerInstallationInfo provides the name of the pod in which Pinniped is running and the namespace in which Pinniped is deployed.
+	ServerInstallationInfo *downward.PodInfo
 
 	// NamesConfig comes from the Pinniped config API (see api.Config). It specifies how Kubernetes
 	// objects should be named.
@@ -78,24 +80,29 @@ type Config struct {
 // Prepare the controllers and their informers and return a function that will start them when called.
 //nolint:funlen // Eh, fair, it is a really long function...but it is wiring the world...so...
 func PrepareControllers(c *Config) (func(ctx context.Context), error) {
-	client, err := kubeclient.New() // TODO wire in dref
+	dref, _, err := deploymentref.New(c.ServerInstallationInfo)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create deployment ref: %w", err)
+	}
+
+	client, err := kubeclient.New(dref)
 	if err != nil {
 		return nil, fmt.Errorf("could not create clients for the controllers: %w", err)
 	}
 
 	// Create informers. Don't forget to make sure they get started in the function returned below.
-	informers := createInformers(c.ServerInstallationNamespace, client.Kubernetes, client.PinnipedConcierge)
+	informers := createInformers(c.ServerInstallationInfo.Namespace, client.Kubernetes, client.PinnipedConcierge)
 
 	// Configuration for the kubecertagent controllers created below.
 	agentPodConfig := &kubecertagent.AgentPodConfig{
-		Namespace:                 c.ServerInstallationNamespace,
+		Namespace:                 c.ServerInstallationInfo.Namespace,
 		ContainerImage:            *c.KubeCertAgentConfig.Image,
 		PodNamePrefix:             *c.KubeCertAgentConfig.NamePrefix,
 		ContainerImagePullSecrets: c.KubeCertAgentConfig.ImagePullSecrets,
 		AdditionalLabels:          c.Labels,
 	}
 	credentialIssuerLocationConfig := &kubecertagent.CredentialIssuerLocationConfig{
-		Namespace: c.ServerInstallationNamespace,
+		Namespace: c.ServerInstallationInfo.Namespace,
 		Name:      c.NamesConfig.CredentialIssuer,
 	}
 
@@ -107,7 +114,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		// CredentialIssuer resource and keeping that information up to date.
 		WithController(
 			issuerconfig.NewKubeConfigInfoPublisherController(
-				c.ServerInstallationNamespace,
+				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.CredentialIssuer,
 				c.Labels,
 				c.DiscoveryURLOverride,
@@ -121,7 +128,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		// API certs controllers are responsible for managing the TLS certificates used to serve Pinniped's API.
 		WithController(
 			apicerts.NewCertsManagerController(
-				c.ServerInstallationNamespace,
+				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.ServingCertificateSecret,
 				c.Labels,
 				client.Kubernetes,
@@ -136,7 +143,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		).
 		WithController(
 			apicerts.NewAPIServiceUpdaterController(
-				c.ServerInstallationNamespace,
+				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.ServingCertificateSecret,
 				loginv1alpha1.SchemeGroupVersion.Version+"."+loginv1alpha1.GroupName,
 				client.Aggregation,
@@ -147,7 +154,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		).
 		WithController(
 			apicerts.NewCertsObserverController(
-				c.ServerInstallationNamespace,
+				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.ServingCertificateSecret,
 				c.DynamicServingCertProvider,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
@@ -157,7 +164,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		).
 		WithController(
 			apicerts.NewCertsExpirerController(
-				c.ServerInstallationNamespace,
+				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.ServingCertificateSecret,
 				client.Kubernetes,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),

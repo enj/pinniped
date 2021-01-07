@@ -3,6 +3,7 @@ package deploymentref
 import (
 	"context"
 	"fmt"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,31 +14,30 @@ import (
 	"go.pinniped.dev/internal/ownerref"
 )
 
-func New(ctx context.Context, podInfo *downward.PodInfo) (kubeclient.Option, *appsv1.Deployment, error) {
+func New(podInfo *downward.PodInfo) (kubeclient.Option, *appsv1.Deployment, error) {
 	tempClient, err := kubeclient.New()
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot create temp client: %w", err)
 	}
 
-	supervisorDeployment, err := getSupervisorDeployment(ctx, tempClient.Kubernetes, podInfo)
+	deployment, err := getDeployment(tempClient.Kubernetes, podInfo)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cannot get supervisor deployment: %w", err)
+		return nil, nil, fmt.Errorf("cannot get deployment: %w", err)
 	}
 
 	ref := metav1.OwnerReference{
-		Name: supervisorDeployment.Name,
-		UID:  supervisorDeployment.UID,
+		Name: deployment.Name,
+		UID:  deployment.UID,
 	}
 	ref.APIVersion, ref.Kind = appsv1.SchemeGroupVersion.WithKind("Deployment").ToAPIVersionAndKind()
 
-	return kubeclient.WithMiddleware(ownerref.New(ref)), supervisorDeployment, nil
+	return kubeclient.WithMiddleware(ownerref.New(ref)), deployment, nil
 }
 
-func getSupervisorDeployment(
-	ctx context.Context,
-	kubeClient kubernetes.Interface,
-	podInfo *downward.PodInfo,
-) (*appsv1.Deployment, error) {
+func getDeployment(kubeClient kubernetes.Interface, podInfo *downward.PodInfo) (*appsv1.Deployment, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	ns := podInfo.Namespace
 
 	pod, err := kubeClient.CoreV1().Pods(ns).Get(ctx, podInfo.Name, metav1.GetOptions{})
