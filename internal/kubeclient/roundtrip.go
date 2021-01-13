@@ -11,7 +11,10 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path"
+	"strings"
 
+	"go.pinniped.dev/internal/plog"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,17 +26,23 @@ import (
 // TODO unit test
 
 type Middleware interface {
-	HandleRequest(ctx context.Context, req Request)
-	HandleResponse(ctx context.Context, resp Response)
+	HandleRequest(ctx context.Context, req Request) ResponseHandler
+}
+
+type ResponseHandler func(ctx context.Context, resp Response)
+
+type Object interface {
+	runtime.Object // generic access to TypeMeta
+	metav1.Object  // generic access to ObjectMeta
 }
 
 // TODO consider adding methods for namespace, name, subresource filtering
 type Request interface {
 	Verb() Verb
-	MutateOutput(f func(obj metav1.Object))
+	MutateOutput(f func(obj Object))
 }
 type Response interface {
-	MutateInput(f func(obj metav1.Object))
+	MutateInput(f func(obj Object))
 }
 
 type Verb interface {
@@ -61,6 +70,12 @@ type verb string
 func (verb) verb() {}
 
 func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, middlewares []Middleware) *restclient.Config {
+	hostURL, apiPathPrefix, err := getHostAndAPIPathPrefix(config)
+	if err != nil {
+		plog.DebugErr("invalid rest config", err)
+		return config // invalid input config, will fail existing client-go validation
+	}
+
 	// no need for any wrapping when we have no middleware to inject
 	if len(middlewares) == 0 {
 		return config
@@ -79,7 +94,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 	f := func(rt http.RoundTripper) http.RoundTripper {
 		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-			reqInfo, err := resolver.NewRequestInfo(req)
+			reqInfo, err := resolver.NewRequestInfo(reqWithoutPrefix(req, hostURL, apiPathPrefix))
 			if err != nil || !reqInfo.IsResourceRequest {
 				return rt.RoundTrip(req) // we only handle kube resource requests
 			}
@@ -102,42 +117,54 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 				// attempt to decode with no defaults or into specified, i.e. defer to the decoder
 				// this should result in the a straight decode with no conversion
-				obj, _, err := regSerializer.Decode(data, nil, nil)
+				decodedObj, _, err := regSerializer.Decode(data, nil, nil)
 				if err != nil {
 					return nil, fmt.Errorf("body decode failed: %w", err)
 				}
 
-				origGroup := obj.GetObjectKind().GroupVersionKind().Group
-
-				accessor, err := meta.Accessor(obj)
-				if err != nil {
+				obj, ok := decodedObj.(Object)
+				if !ok {
 					return rt.RoundTrip(req) // ignore everything that has no object meta for now
 				}
+
+				origGVK := obj.GetObjectKind().GroupVersionKind()
 
 				// we plan on making a new request so make sure to close the original request's body
 				_ = req.Body.Close()
 
 				middlewareReq := &request{
 					verb: v,
-					obj:  accessor,
+					obj:  obj,
 				}
 
+				var responseHandlers []ResponseHandler
 				for _, middleware := range middlewares {
-					middleware.HandleRequest(req.Context(), middlewareReq)
+					middleware := middleware
+					responseHandler := middleware.HandleRequest(req.Context(), middlewareReq)
+					if responseHandler != nil {
+						responseHandlers = append(responseHandlers, responseHandler)
+					}
 				}
 
-				newGroup := obj.GetObjectKind().GroupVersionKind().Group
+				newGVK := obj.GetObjectKind().GroupVersionKind()
+
+				needsPathUpdate := origGVK != newGVK
 
 				reqURL := req.URL
-				if origGroup != newGroup {
-					if len(origGroup) == 0 {
+				if needsPathUpdate {
+					if len(origGVK.Group) == 0 {
 						return nil, fmt.Errorf("invalid attempt to change core group")
 					}
 
 					newURL := &url.URL{}
 					*newURL = *reqURL
 
-					// TODO replace old api group with new group in path
+					// replace old GVK with new GVK
+					apiRoot := path.Join(apiPathPrefix, "apis")
+					oldPrefix := restclient.DefaultVersionedAPIPath(apiRoot, origGVK.GroupVersion())
+					newPrefix := restclient.DefaultVersionedAPIPath(apiRoot, newGVK.GroupVersion())
+
+					newURL.Path = path.Join(newPrefix, strings.TrimPrefix(newURL.Path, oldPrefix))
 
 					reqURL = newURL
 				}
@@ -194,6 +221,10 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				}
 
 				// TODO handle GVK
+				if needsPathUpdate {
+					respData = respData
+				}
+
 				respObj, _, err := respInfo.Serializer.Decode(respData, nil, nil)
 				if err != nil {
 					return nil, fmt.Errorf("resp body decode failed: %w", err)
@@ -208,8 +239,9 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 					obj: respAccessor,
 				}
 
-				for _, middleware := range middlewares {
-					middleware.HandleResponse(req.Context(), middlewareResp)
+				for _, responseHandler := range responseHandlers {
+					responseHandler := responseHandler
+					responseHandler(req.Context(), middlewareResp)
 				}
 
 				newRespData, err := runtime.Encode(respInfo.Serializer, respObj)
@@ -259,7 +291,7 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 type request struct {
 	verb Verb
 	// group string
-	obj metav1.Object
+	obj Object
 	// err error
 }
 
@@ -276,14 +308,52 @@ func (r *request) Verb() Verb {
 // 	r.resource = resource
 // }
 
-func (r *request) MutateOutput(f func(obj metav1.Object)) {
+func (r *request) MutateOutput(f func(obj Object)) {
 	f(r.obj)
 }
 
 type response struct {
-	obj metav1.Object
+	obj Object
 }
 
-func (r *response) MutateInput(f func(obj metav1.Object)) {
+func (r *response) MutateInput(f func(obj Object)) {
 	f(r.obj)
+}
+
+func getHostAndAPIPathPrefix(config *restclient.Config) (string, string, error) {
+	hostURL, _, err := defaultServerUrlFor(config)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to parse host URL from rest config: %w", err)
+	}
+
+	return hostURL.String(), hostURL.Path, nil
+}
+
+func reqWithoutPrefix(req *http.Request, hostURL, apiPathPrefix string) *http.Request {
+	if len(apiPathPrefix) == 0 {
+		return req
+	}
+
+	if !strings.HasSuffix(hostURL, "/") {
+		hostURL += "/"
+	}
+
+	if !strings.HasPrefix(req.URL.String(), hostURL) {
+		return req
+	}
+
+	if !strings.HasPrefix(apiPathPrefix, "/") {
+		apiPathPrefix = "/" + apiPathPrefix
+	}
+	if !strings.HasSuffix(apiPathPrefix, "/") {
+		apiPathPrefix += "/"
+	}
+
+	reqCopy := req.WithContext(req.Context())
+	urlCopy := &url.URL{}
+	*urlCopy = *reqCopy.URL
+	urlCopy.Path = "/" + strings.TrimPrefix(urlCopy.Path, apiPathPrefix)
+	reqCopy.URL = urlCopy
+
+	return reqCopy
 }
