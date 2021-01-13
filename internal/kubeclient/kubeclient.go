@@ -6,7 +6,6 @@ package kubeclient
 import (
 	"fmt"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
@@ -27,12 +26,6 @@ type Client struct {
 	PinnipedSupervisor pinnipedsupervisorclientset.Interface
 
 	JSONConfig, ProtoConfig *restclient.Config
-}
-
-// TODO expand this interface to address more complex use cases.
-type Middleware interface {
-	Handles(httpMethod string) bool
-	Mutate(obj metav1.Object) (mutated bool)
 }
 
 func New(opts ...Option) (*Client, error) {
