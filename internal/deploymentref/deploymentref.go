@@ -34,7 +34,7 @@ func New(podInfo *downward.PodInfo) (kubeclient.Option, *appsv1.Deployment, erro
 	}
 	ref.APIVersion, ref.Kind = appsv1.SchemeGroupVersion.WithKind("Deployment").ToAPIVersionAndKind()
 
-	return kubeclient.WithMiddleware(ownerref.New(ref)), deployment, nil
+	return kubeclient.WithMiddleware(ownerref.New(ref, deployment.Namespace)), deployment, nil
 }
 
 func getDeployment(kubeClient kubernetes.Interface, podInfo *downward.PodInfo) (*appsv1.Deployment, error) {
