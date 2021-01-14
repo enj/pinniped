@@ -6,6 +6,7 @@ package kubeclient
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"mime"
@@ -15,9 +16,9 @@ import (
 	"strings"
 
 	"go.pinniped.dev/internal/plog"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
@@ -26,23 +27,19 @@ import (
 // TODO unit test
 
 type Middleware interface {
-	HandleRequest(ctx context.Context, req Request) ResponseHandler
+	Handle(ctx context.Context, rt RoundTrip)
 }
 
-type ResponseHandler func(ctx context.Context, resp Response)
+// TODO consider adding methods for namespace, name, subresource filtering
+type RoundTrip interface {
+	Verb() Verb
+	Resource() schema.GroupVersionResource
+	Mutate(req func(obj Object)) // TODO add resp mutation support
+}
 
 type Object interface {
 	runtime.Object // generic access to TypeMeta
 	metav1.Object  // generic access to ObjectMeta
-}
-
-// TODO consider adding methods for namespace, name, subresource filtering
-type Request interface {
-	Verb() Verb
-	MutateOutput(f func(obj Object))
-}
-type Response interface {
-	MutateInput(f func(obj Object))
 }
 
 type Verb interface {
@@ -99,8 +96,28 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				return rt.RoundTrip(req) // we only handle kube resource requests
 			}
 
+			resource := schema.GroupVersionResource{
+				Group:    reqInfo.APIGroup,
+				Version:  reqInfo.APIVersion,
+				Resource: reqInfo.Resource,
+			}
+
 			switch v := verb(reqInfo.Verb); v {
 			case VerbCreate, VerbUpdate:
+				middlewareReq := &request{
+					verb:     v,
+					resource: resource,
+				}
+
+				for _, middleware := range middlewares {
+					middleware := middleware
+					middleware.Handle(req.Context(), middlewareReq)
+				}
+
+				if len(middlewareReq.objFuncs) == 0 {
+					return rt.RoundTrip(req) // no middleware wanted to mutate this request
+				}
+
 				if req.GetBody == nil {
 					return nil, fmt.Errorf("unreadible body for %s request for %s", v, reqInfo.Resource) // this should never happen
 				}
@@ -123,30 +140,27 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				}
 
 				obj, ok := decodedObj.(Object)
-				if !ok {
+				if !ok { // TODO maybe this should error?
 					return rt.RoundTrip(req) // ignore everything that has no object meta for now
 				}
 
 				origGVK := obj.GetObjectKind().GroupVersionKind()
+				if origGVK.Empty() {
+					return nil, fmt.Errorf("invalid empty orig GVK ")
+				}
+
+				for _, objFunc := range middlewareReq.objFuncs {
+					objFunc := objFunc
+					objFunc(obj) // TODO check for mutation against a deep copy and short circuit?
+				}
 
 				// we plan on making a new request so make sure to close the original request's body
 				_ = req.Body.Close()
 
-				middlewareReq := &request{
-					verb: v,
-					obj:  obj,
-				}
-
-				var responseHandlers []ResponseHandler
-				for _, middleware := range middlewares {
-					middleware := middleware
-					responseHandler := middleware.HandleRequest(req.Context(), middlewareReq)
-					if responseHandler != nil {
-						responseHandlers = append(responseHandlers, responseHandler)
-					}
-				}
-
 				newGVK := obj.GetObjectKind().GroupVersionKind()
+				if newGVK.Empty() {
+					return nil, fmt.Errorf("invalid empty new GVK ")
+				}
 
 				needsPathUpdate := origGVK != newGVK
 
@@ -189,6 +203,10 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				newReq.Body = newReqForBody.Body
 				newReq.GetBody = newReqForBody.GetBody
 
+				if !needsPathUpdate {
+					return rt.RoundTrip(newReq) // we did not change the GVK, so we do not need to mess with the incoming data
+				}
+
 				resp, err := rt.RoundTrip(newReq)
 				if err != nil {
 					return nil, fmt.Errorf("request failed: %w", err)
@@ -220,39 +238,25 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 					return nil, fmt.Errorf("unable to find resp serialier for %s with content-type %s", reqInfo.Resource, mediaType)
 				}
 
-				// TODO handle GVK
-				if needsPathUpdate {
-					respData = respData
-				}
+				// the body could be an API status, random trash or the actual object we want
+				unknown := &runtime.Unknown{}
+				_, _, _ = respInfo.Serializer.Decode(respData, nil, unknown) // we do not care about the return values
 
-				respObj, _, err := respInfo.Serializer.Decode(respData, nil, nil)
-				if err != nil {
-					return nil, fmt.Errorf("resp body decode failed: %w", err)
-				}
+				fixedRespData := respData
+				doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != newGVK
 
-				respAccessor, err := meta.Accessor(respObj)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get meta for resp: %w", err)
-				}
-
-				middlewareResp := &response{
-					obj: respAccessor,
-				}
-
-				for _, responseHandler := range responseHandlers {
-					responseHandler := responseHandler
-					responseHandler(req.Context(), middlewareResp)
-				}
-
-				newRespData, err := runtime.Encode(respInfo.Serializer, respObj)
-				if err != nil {
-					return nil, fmt.Errorf("new resp body encode failed: %w", err)
+				if !doesNotNeedGVKFix {
+					gvkFixedData, err := restoreGVK(respInfo.Serializer, unknown, origGVK)
+					if err != nil {
+						return nil, fmt.Errorf("failed to restore GVK: %w", err)
+					}
+					fixedRespData = gvkFixedData
 				}
 
 				newResp := &http.Response{}
 				*newResp = *resp
 
-				newResp.Body = ioutil.NopCloser(bytes.NewBuffer(newRespData))
+				newResp.Body = ioutil.NopCloser(bytes.NewBuffer(fixedRespData))
 				return newResp, nil
 
 			case VerbDelete, VerbDeleteCollection:
@@ -289,35 +293,21 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 type request struct {
-	verb Verb
-	// group string
-	obj Object
-	// err error
+	verb     Verb
+	resource schema.GroupVersionResource
+	objFuncs []func(obj Object)
 }
 
 func (r *request) Verb() Verb {
 	return r.verb
 }
 
-// func (r *request) SetPath(resource schema.GroupVersionResource) {
-// 	if len(r.group) != 0 {
-// 		r.err = fmt.Errorf("set path called more than once: old=%s new=%s", r.group, resource)
-// 		return
-// 	}
-//
-// 	r.resource = resource
-// }
-
-func (r *request) MutateOutput(f func(obj Object)) {
-	f(r.obj)
+func (r *request) Resource() schema.GroupVersionResource {
+	return r.resource
 }
 
-type response struct {
-	obj Object
-}
-
-func (r *response) MutateInput(f func(obj Object)) {
-	f(r.obj)
+func (r *request) Mutate(req func(obj Object)) {
+	r.objFuncs = append(r.objFuncs, req)
 }
 
 func getHostAndAPIPathPrefix(config *restclient.Config) (string, string, error) {
@@ -356,4 +346,54 @@ func reqWithoutPrefix(req *http.Request, hostURL, apiPathPrefix string) *http.Re
 	reqCopy.URL = urlCopy
 
 	return reqCopy
+}
+
+func restoreGVK(encoder runtime.Encoder, unknown *runtime.Unknown, gvk schema.GroupVersionKind) ([]byte, error) {
+	typeMeta := runtime.TypeMeta{}
+	typeMeta.APIVersion, typeMeta.Kind = gvk.ToAPIVersionAndKind()
+
+	newUnknown := &runtime.Unknown{}
+	*newUnknown = *unknown
+	newUnknown.TypeMeta = typeMeta
+
+	switch newUnknown.ContentType {
+	case runtime.ContentTypeJSON:
+		// json is messy if we want to avoid decoding the whole object
+		keysOnly := map[string]json.RawMessage{}
+
+		// get the keys.  this does not preserve order.
+		if err := json.Unmarshal(newUnknown.Raw, &keysOnly); err != nil {
+			return nil, fmt.Errorf("failed to unmarshall json keys: %w", err)
+		}
+
+		// turn the type meta into JSON bytes
+		typeMetaBytes, err := json.Marshal(typeMeta)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshall type meta: %w", err)
+		}
+
+		// overwrite the type meta keys with the new data
+		// TODO confirm this actually works
+		if err := json.Unmarshal(typeMetaBytes, &keysOnly); err != nil {
+			return nil, fmt.Errorf("failed to type meta keys: %w", err)
+		}
+
+		// marshall everything back to bytes
+		newRaw, err := json.Marshal(keysOnly)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshall new raw: %w", err)
+		}
+
+		// we could just return the bytes but it feels weird to not use the encoder
+		newUnknown.Raw = newRaw
+
+	case runtime.ContentTypeProtobuf:
+		// protobuf is easy because of the unknown wrapper
+		// newUnknown.Raw already contains the correct data we need
+
+	default:
+		return nil, fmt.Errorf("unknown content type: %s", newUnknown.ContentType) // this should never happen
+	}
+
+	return runtime.Encode(encoder, newUnknown)
 }
