@@ -40,11 +40,12 @@ func (f MiddlewareFunc) Handle(ctx context.Context, rt RoundTrip) {
 	f(ctx, rt)
 }
 
-// TODO consider adding methods for namespace, name, subresource filtering
+// TODO consider adding methods for name, subresource filtering
 type RoundTrip interface {
 	Verb() Verb
+	Namespace() string // this is the only valid way to check namespace, Object.GetNamespace() will almost always be empty
 	Resource() schema.GroupVersionResource
-	Mutate(req func(obj Object)) // TODO add resp mutation support
+	MutateRequest(f func(obj Object)) // TODO add response mutation support if we come up with a good use case
 }
 
 type Object interface {
@@ -53,6 +54,7 @@ type Object interface {
 }
 
 type Verb interface {
+	// TODO check if we need a String() method
 	verb() // private method to prevent creation of verbs outside this package
 }
 
@@ -106,30 +108,29 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				return rt.RoundTrip(req) // we only handle kube resource requests
 			}
 
-			resource := schema.GroupVersionResource{
-				Group:    reqInfo.APIGroup,
-				Version:  reqInfo.APIVersion,
-				Resource: reqInfo.Resource,
+			middlewareReq := &request{
+				verb:      verb(reqInfo.Verb),
+				namespace: reqInfo.Namespace,
+				resource: schema.GroupVersionResource{
+					Group:    reqInfo.APIGroup,
+					Version:  reqInfo.APIVersion,
+					Resource: reqInfo.Resource,
+				},
 			}
 
-			switch v := verb(reqInfo.Verb); v {
+			switch middlewareReq.Verb() {
 			case VerbCreate, VerbUpdate:
-				middlewareReq := &request{
-					verb:     v,
-					resource: resource,
-				}
-
 				for _, middleware := range middlewares {
 					middleware := middleware
 					middleware.Handle(req.Context(), middlewareReq)
 				}
 
-				if len(middlewareReq.objFuncs) == 0 {
+				if len(middlewareReq.reqFuncs) == 0 {
 					return rt.RoundTrip(req) // no middleware wanted to mutate this request
 				}
 
 				if req.GetBody == nil {
-					return nil, fmt.Errorf("unreadible body for %s request for %s", v, reqInfo.Resource) // this should never happen
+					return nil, fmt.Errorf("unreadible body for request: %#v", middlewareReq) // this should never happen
 				}
 
 				body, err := req.GetBody()
@@ -161,12 +162,12 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 				origObj, ok := obj.DeepCopyObject().(Object)
 				if !ok {
-					return nil, fmt.Errorf("invalid deep copy semantics for %s", resource)
+					return nil, fmt.Errorf("invalid deep copy semantics for %T: %#v", obj, middlewareReq)
 				}
 
-				for _, objFunc := range middlewareReq.objFuncs {
-					objFunc := objFunc
-					objFunc(obj)
+				for _, reqFunc := range middlewareReq.reqFuncs {
+					reqFunc := reqFunc
+					reqFunc(obj)
 				}
 
 				if apiequality.Semantic.DeepEqual(origObj, obj) {
@@ -254,7 +255,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				}
 				respInfo, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), mediaType)
 				if !ok {
-					return nil, fmt.Errorf("unable to find resp serialier for %s with content-type %s", reqInfo.Resource, mediaType)
+					return nil, fmt.Errorf("unable to find resp serialier for %#v with content-type %s", middlewareReq, mediaType)
 				}
 
 				// the body could be an API status, random trash or the actual object we want
@@ -311,22 +312,29 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+var _ RoundTrip = &request{}
+
 type request struct {
-	verb     Verb
-	resource schema.GroupVersionResource
-	objFuncs []func(obj Object)
+	verb      Verb
+	namespace string
+	resource  schema.GroupVersionResource
+	reqFuncs  []func(obj Object)
 }
 
 func (r *request) Verb() Verb {
 	return r.verb
 }
 
+func (r *request) Namespace() string {
+	return r.namespace
+}
+
 func (r *request) Resource() schema.GroupVersionResource {
 	return r.resource
 }
 
-func (r *request) Mutate(req func(obj Object)) {
-	r.objFuncs = append(r.objFuncs, req)
+func (r *request) MutateRequest(f func(obj Object)) {
+	r.reqFuncs = append(r.reqFuncs, f)
 }
 
 func getHostAndAPIPathPrefix(config *restclient.Config) (string, string, error) {
