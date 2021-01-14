@@ -20,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
 
@@ -118,17 +119,17 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				},
 			}
 
+			for _, middleware := range middlewares {
+				middleware := middleware
+				middleware.Handle(req.Context(), middlewareReq)
+			}
+
+			if len(middlewareReq.reqFuncs) == 0 {
+				return rt.RoundTrip(req) // no middleware wanted to mutate this request
+			}
+
 			switch middlewareReq.Verb() {
 			case VerbCreate, VerbUpdate:
-				for _, middleware := range middlewares {
-					middleware := middleware
-					middleware.Handle(req.Context(), middlewareReq)
-				}
-
-				if len(middlewareReq.reqFuncs) == 0 {
-					return rt.RoundTrip(req) // no middleware wanted to mutate this request
-				}
-
 				if req.GetBody == nil {
 					return nil, fmt.Errorf("unreadible body for request: %#v", middlewareReq) // this should never happen
 				}
@@ -155,52 +156,21 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 					return rt.RoundTrip(req) // ignore everything that has no object meta for now
 				}
 
-				origGVK := obj.GetObjectKind().GroupVersionKind()
-				if origGVK.Empty() {
-					return nil, fmt.Errorf("invalid empty orig GVK ")
+				result, err := middlewareReq.mutate(obj)
+				if err != nil {
+					return nil, err
 				}
 
-				origObj, ok := obj.DeepCopyObject().(Object)
-				if !ok {
-					return nil, fmt.Errorf("invalid deep copy semantics for %T: %#v", obj, middlewareReq)
-				}
-
-				for _, reqFunc := range middlewareReq.reqFuncs {
-					reqFunc := reqFunc
-					reqFunc(obj)
-				}
-
-				if apiequality.Semantic.DeepEqual(origObj, obj) {
+				if !result.mutated {
 					return rt.RoundTrip(req) // no middleware mutated the request
 				}
 
 				// we plan on making a new request so make sure to close the original request's body
 				_ = req.Body.Close()
 
-				newGVK := obj.GetObjectKind().GroupVersionKind()
-				if newGVK.Empty() {
-					return nil, fmt.Errorf("invalid empty new GVK ")
-				}
-
-				needsPathUpdate := origGVK != newGVK
-
-				reqURL := req.URL
-				if needsPathUpdate {
-					if len(origGVK.Group) == 0 {
-						return nil, fmt.Errorf("invalid attempt to change core group")
-					}
-
-					newURL := &url.URL{}
-					*newURL = *reqURL
-
-					// replace old GVK with new GVK
-					apiRoot := path.Join(apiPathPrefix, "apis")
-					oldPrefix := restclient.DefaultVersionedAPIPath(apiRoot, origGVK.GroupVersion())
-					newPrefix := restclient.DefaultVersionedAPIPath(apiRoot, newGVK.GroupVersion())
-
-					newURL.Path = path.Join(newPrefix, strings.TrimPrefix(newURL.Path, oldPrefix))
-
-					reqURL = newURL
+				reqURL, err := updatePathNewGVK(req.URL, result, apiPathPrefix, reqInfo)
+				if err != nil {
+					return nil, err
 				}
 
 				newData, err := runtime.Encode(regSerializer, obj)
@@ -223,76 +193,63 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				newReq.Body = newReqForBody.Body
 				newReq.GetBody = newReqForBody.GetBody
 
-				if !needsPathUpdate {
+				if !result.needsPathUpdate {
 					return rt.RoundTrip(newReq) // we did not change the GVK, so we do not need to mess with the incoming data
 				}
 
-				resp, err := rt.RoundTrip(newReq)
+				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
+
+			case VerbGet:
+				obj := &metav1.PartialObjectMetadata{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "TODO", // TODO go from GVR to GVK?
+						APIVersion: middlewareReq.Resource().GroupVersion().String(),
+					},
+					// no need to do anything with object meta since we only support GVK changes
+				}
+
+				result, err := middlewareReq.mutate(obj)
 				if err != nil {
-					return nil, fmt.Errorf("request failed: %w", err)
+					return nil, err
 				}
 
-				switch {
-				case resp.StatusCode == http.StatusSwitchingProtocols,
-					resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent:
-					return resp, nil
+				if !result.mutated {
+					return rt.RoundTrip(req) // no middleware mutated the request
 				}
 
-				respData, err := ioutil.ReadAll(resp.Body)
+				metaIsZero := apiequality.Semantic.DeepEqual(obj.ObjectMeta, metav1.ObjectMeta{})
+				if !result.needsPathUpdate || !metaIsZero {
+					return nil, fmt.Errorf("invalid object meta mutation: %#v", middlewareReq)
+				}
+
+				reqURL, err := updatePathNewGVK(req.URL, result, apiPathPrefix, reqInfo)
 				if err != nil {
-					return nil, fmt.Errorf("failed to read response body: %w", err)
+					return nil, err
 				}
 
-				_ = resp.Body.Close()
+				// shallow copy because we want to preserve all the headers and such but not mutate the original request
+				newReq := req.WithContext(req.Context())
 
-				contentType := resp.Header.Get("Content-Type")
-				if len(contentType) == 0 {
-					contentType = config.ContentType
-				}
-				mediaType, _, err := mime.ParseMediaType(contentType)
-				if err != nil {
-					return nil, fmt.Errorf("failed to parse content type: %w", err)
-				}
-				respInfo, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), mediaType)
-				if !ok {
-					return nil, fmt.Errorf("unable to find resp serialier for %#v with content-type %s", middlewareReq, mediaType)
-				}
+				// replace the body and path with the new data
+				newReq.URL = reqURL
 
-				// the body could be an API status, random trash or the actual object we want
-				unknown := &runtime.Unknown{}
-				_, _, _ = respInfo.Serializer.Decode(respData, nil, unknown) // we do not care about the return values
-
-				fixedRespData := respData
-				doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != newGVK
-
-				if !doesNotNeedGVKFix {
-					gvkFixedData, err := restoreGVK(respInfo.Serializer, unknown, origGVK)
-					if err != nil {
-						return nil, fmt.Errorf("failed to restore GVK: %w", err)
-					}
-					fixedRespData = gvkFixedData
-				}
-
-				newResp := &http.Response{}
-				*newResp = *resp
-
-				newResp.Body = ioutil.NopCloser(bytes.NewBuffer(fixedRespData))
-				return newResp, nil
+				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
 
 			case VerbDelete, VerbDeleteCollection:
 				// TODO
 				fallthrough
-			case VerbGet:
-				// TODO
-				fallthrough
+
 			case VerbList:
 				// TODO
 				fallthrough
+
 			case VerbWatch:
 				// TODO
 				fallthrough
+
 			case VerbPatch, VerbProxy: // TODO for now we do not support patch or proxy interception
 				fallthrough
+
 			default:
 				return rt.RoundTrip(req) // we only handle certain verbs
 			}
@@ -335,6 +292,123 @@ func (r *request) Resource() schema.GroupVersionResource {
 
 func (r *request) MutateRequest(f func(obj Object)) {
 	r.reqFuncs = append(r.reqFuncs, f)
+}
+
+type mutationResult struct {
+	origGVK, newGVK          schema.GroupVersionKind
+	needsPathUpdate, mutated bool
+}
+
+func (r *request) mutate(obj Object) (*mutationResult, error) {
+	origGVK := obj.GetObjectKind().GroupVersionKind()
+	if origGVK.Empty() {
+		return nil, fmt.Errorf("invalid empty orig GVK for %T: %#v", obj, r)
+	}
+
+	origObj, ok := obj.DeepCopyObject().(Object)
+	if !ok {
+		return nil, fmt.Errorf("invalid deep copy semantics for %T: %#v", obj, r)
+	}
+
+	for _, reqFunc := range r.reqFuncs {
+		reqFunc := reqFunc
+		reqFunc(obj)
+	}
+
+	newGVK := obj.GetObjectKind().GroupVersionKind()
+	if newGVK.Empty() {
+		return nil, fmt.Errorf("invalid empty new GVK for %T: %#v", obj, r)
+	}
+
+	return &mutationResult{
+		origGVK:         origGVK,
+		newGVK:          newGVK,
+		needsPathUpdate: origGVK != newGVK, // TODO support namespace and name changes?
+		mutated:         !apiequality.Semantic.DeepEqual(origObj, obj),
+	}, nil
+}
+
+func updatePathNewGVK(reqURL *url.URL, result *mutationResult, apiPathPrefix string, reqInfo *genericapirequest.RequestInfo) (*url.URL, error) {
+	if !result.needsPathUpdate {
+		return reqURL, nil
+	}
+
+	if len(result.origGVK.Group) == 0 {
+		return nil, fmt.Errorf("invalid attempt to change core group") // TODO do we care?
+	}
+
+	newURL := &url.URL{}
+	*newURL = *reqURL
+
+	// replace old GVK with new GVK
+	apiRoot := path.Join(apiPathPrefix, reqInfo.APIPrefix)
+	oldPrefix := restclient.DefaultVersionedAPIPath(apiRoot, result.origGVK.GroupVersion())
+	newPrefix := restclient.DefaultVersionedAPIPath(apiRoot, result.newGVK.GroupVersion())
+
+	newURL.Path = path.Join(newPrefix, strings.TrimPrefix(newURL.Path, oldPrefix))
+
+	return newURL, nil
+}
+
+func handleResponseNewGVK(
+	config *restclient.Config,
+	negotiatedSerializer runtime.NegotiatedSerializer,
+	rt http.RoundTripper,
+	newReq *http.Request,
+	middlewareReq *request,
+	result *mutationResult,
+) (*http.Response, error) {
+	resp, err := rt.RoundTrip(newReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	switch {
+	case resp.StatusCode == http.StatusSwitchingProtocols,
+		resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent:
+		return resp, nil
+	}
+
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	_ = resp.Body.Close()
+
+	contentType := resp.Header.Get("Content-Type")
+	if len(contentType) == 0 {
+		contentType = config.ContentType
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse content type: %w", err)
+	}
+	respInfo, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), mediaType)
+	if !ok {
+		return nil, fmt.Errorf("unable to find resp serialier for %#v with content-type %s", middlewareReq, mediaType)
+	}
+
+	// the body could be an API status, random trash or the actual object we want
+	unknown := &runtime.Unknown{}
+	_, _, _ = respInfo.Serializer.Decode(respData, nil, unknown) // we do not care about the return values
+
+	fixedRespData := respData
+	doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != result.newGVK
+
+	if !doesNotNeedGVKFix {
+		gvkFixedData, err := restoreGVK(respInfo.Serializer, unknown, result.origGVK)
+		if err != nil {
+			return nil, fmt.Errorf("failed to restore GVK: %w", err)
+		}
+		fixedRespData = gvkFixedData
+	}
+
+	newResp := &http.Response{}
+	*newResp = *resp
+
+	newResp.Body = ioutil.NopCloser(bytes.NewBuffer(fixedRespData))
+	return newResp, nil
 }
 
 func getHostAndAPIPathPrefix(config *restclient.Config) (string, string, error) {
