@@ -32,6 +32,14 @@ type Middleware interface {
 	Handle(ctx context.Context, rt RoundTrip)
 }
 
+var _ Middleware = MiddlewareFunc(nil)
+
+type MiddlewareFunc func(ctx context.Context, rt RoundTrip)
+
+func (f MiddlewareFunc) Handle(ctx context.Context, rt RoundTrip) {
+	f(ctx, rt)
+}
+
 // TODO consider adding methods for namespace, name, subresource filtering
 type RoundTrip interface {
 	Verb() Verb
