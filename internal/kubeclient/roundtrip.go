@@ -15,13 +15,15 @@ import (
 	"path"
 	"strings"
 
-	"go.pinniped.dev/internal/plog"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
+
+	"go.pinniped.dev/internal/plog"
 )
 
 // TODO unit test
@@ -149,9 +151,18 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 					return nil, fmt.Errorf("invalid empty orig GVK ")
 				}
 
+				origObj, ok := obj.DeepCopyObject().(Object)
+				if !ok {
+					return nil, fmt.Errorf("invalid deep copy semantics for %s", resource)
+				}
+
 				for _, objFunc := range middlewareReq.objFuncs {
 					objFunc := objFunc
-					objFunc(obj) // TODO check for mutation against a deep copy and short circuit?
+					objFunc(obj)
+				}
+
+				if apiequality.Semantic.DeepEqual(origObj, obj) {
+					return rt.RoundTrip(req) // no middleware mutated the request
 				}
 
 				// we plan on making a new request so make sure to close the original request's body
