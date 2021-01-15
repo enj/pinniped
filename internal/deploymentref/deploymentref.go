@@ -28,13 +28,10 @@ func New(podInfo *downward.PodInfo) (kubeclient.Option, *appsv1.Deployment, erro
 		return nil, nil, fmt.Errorf("cannot get deployment: %w", err)
 	}
 
-	ref := metav1.OwnerReference{
-		Name: deployment.Name,
-		UID:  deployment.UID,
-	}
-	ref.APIVersion, ref.Kind = appsv1.SchemeGroupVersion.WithKind("Deployment").ToAPIVersionAndKind()
+	// work around stupid behavior of WithoutVersionDecoder.Decode
+	deployment.APIVersion, deployment.Kind = appsv1.SchemeGroupVersion.WithKind("Deployment").ToAPIVersionAndKind()
 
-	return kubeclient.WithMiddleware(ownerref.New(ref, deployment.Namespace)), deployment, nil
+	return kubeclient.WithMiddleware(ownerref.New(deployment)), deployment, nil
 }
 
 func getDeployment(kubeClient kubernetes.Interface, podInfo *downward.PodInfo) (*appsv1.Deployment, error) {

@@ -11,14 +11,26 @@ import (
 	"go.pinniped.dev/internal/kubeclient"
 )
 
-func New(ref metav1.OwnerReference, refNamespace string) kubeclient.Middleware {
+func New(refObj kubeclient.Object) kubeclient.Middleware {
+	ref := metav1.OwnerReference{
+		Name: refObj.GetName(),
+		UID:  refObj.GetUID(),
+	}
+	ref.APIVersion, ref.Kind = refObj.GetObjectKind().GroupVersionKind().ToAPIVersionAndKind()
+	refNamespace := refObj.GetNamespace()
+
 	return kubeclient.MiddlewareFunc(func(_ context.Context, rt kubeclient.RoundTrip) {
 		// we should not mess with owner refs on things we did not create
 		if rt.Verb() != kubeclient.VerbCreate {
 			return
 		}
 
-		// if the input refNamespace is empty, we assume the owner ref is to a cluster scoped object which can own any object
+		// we probably do not want to set an owner ref on a subresource
+		if len(rt.Subresource()) != 0 {
+			return
+		}
+
+		// if refNamespace is empty, we assume the owner ref is to a cluster scoped object which can own any object
 		// otherwise, we require refNamespace to match the request namespace since cross namespace ownership is disallowed
 		if len(refNamespace) != 0 && refNamespace != rt.Namespace() {
 			return

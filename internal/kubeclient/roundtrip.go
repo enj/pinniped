@@ -42,11 +42,12 @@ func (f MiddlewareFunc) Handle(ctx context.Context, rt RoundTrip) {
 	f(ctx, rt)
 }
 
-// TODO consider adding methods for name, subresource filtering
+// TODO consider adding methods for name based filtering
 type RoundTrip interface {
 	Verb() Verb
 	Namespace() string // this is the only valid way to check namespace, Object.GetNamespace() will almost always be empty
 	Resource() schema.GroupVersionResource
+	Subresource() string
 	MutateRequest(f func(obj Object)) // TODO add response mutation support if we come up with a good use case
 }
 
@@ -68,10 +69,9 @@ const (
 	VerbGet              verb = "get"
 	VerbList             verb = "list"
 	VerbWatch            verb = "watch"
+	VerbPatch            verb = "patch"
 
-	// TODO these are unsupported for now
-	VerbPatch verb = "patch"
-	VerbProxy verb = "proxy"
+	VerbProxy verb = "proxy" // TODO proxy unsupported for now
 )
 
 var _, _ Verb = VerbGet, verb("")
@@ -118,6 +118,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 					Version:  reqInfo.APIVersion,
 					Resource: reqInfo.Resource,
 				},
+				subresource: reqInfo.Subresource,
 			}
 
 			for _, middleware := range middlewares {
@@ -200,7 +201,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
 
-			case VerbGet, VerbList:
+			case VerbGet, VerbList, VerbDelete, VerbDeleteCollection, VerbPatch:
 				// TODO maybe we want KindsFor[0]?
 				mapperGVK, err := mapper.KindFor(middlewareReq.Resource())
 				if err != nil {
@@ -240,17 +241,18 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				// replace the body and path with the new data
 				newReq.URL = reqURL
 
+				switch v {
+				case VerbDelete, VerbDeleteCollection:
+					return rt.RoundTrip(newReq) // we do not need to fix the response on delete
+				}
+
 				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
 
-			case VerbDelete, VerbDeleteCollection:
-				// TODO
-				fallthrough
-
 			case VerbWatch:
-				// TODO
+				// TODO add watch support
 				fallthrough
 
-			case VerbPatch, VerbProxy: // TODO for now we do not support patch or proxy interception
+			case VerbProxy: // TODO for now we do not support proxy interception
 				fallthrough
 
 			default:
@@ -275,10 +277,11 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 var _ RoundTrip = &request{}
 
 type request struct {
-	verb      Verb
-	namespace string
-	resource  schema.GroupVersionResource
-	reqFuncs  []func(obj Object)
+	verb        Verb
+	namespace   string
+	resource    schema.GroupVersionResource
+	reqFuncs    []func(obj Object)
+	subresource string
 }
 
 func (r *request) Verb() Verb {
@@ -291,6 +294,10 @@ func (r *request) Namespace() string {
 
 func (r *request) Resource() schema.GroupVersionResource {
 	return r.resource
+}
+
+func (r *request) Subresource() string {
+	return r.subresource
 }
 
 func (r *request) MutateRequest(f func(obj Object)) {
