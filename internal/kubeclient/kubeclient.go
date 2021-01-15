@@ -5,15 +5,13 @@ package kubeclient
 
 import (
 	"fmt"
+	"io/ioutil"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/kubernetes"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/restmapper"
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	aggregatorclientscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
 
@@ -39,6 +37,7 @@ func New(opts ...Option) (*Client, error) {
 		opt(c)
 	}
 
+	var runningInCluster bool
 	// default to assuming we are running in a pod with the service account token mounted
 	if c.config == nil {
 		inClusterConfig, err := restclient.InClusterConfig()
@@ -46,6 +45,7 @@ func New(opts ...Option) (*Client, error) {
 			return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
 		}
 		WithConfig(inClusterConfig)(c) // make sure all writes to clientConfig flow through one code path
+		runningInCluster = true
 	}
 
 	// explicitly use json when talking to CRD APIs
@@ -54,7 +54,7 @@ func New(opts ...Option) (*Client, error) {
 	// explicitly use protobuf when talking to built-in kube APIs
 	protoKubeConfig := createProtoKubeConfig(c.config)
 
-	mapper, err := getRESTMapper(protoKubeConfig)
+	mapper, err := getRESTMapper(protoKubeConfig, runningInCluster)
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize REST mapper: %w", err)
 	}
@@ -118,24 +118,17 @@ func createProtoKubeConfig(kubeConfig *restclient.Config) *restclient.Config {
 	return protoKubeConfig
 }
 
-func getRESTMapper(kubeConfig *restclient.Config) (meta.RESTMapper, error) {
-	config := restclient.CopyConfig(kubeConfig)
+func getRESTMapper(kubeConfig *restclient.Config, runningInCluster bool) (meta.RESTMapper, error) {
+	var overrideCacheDir string // TODO wire to --cache-dir like kubectl if needed
 
-	// The more groups you have, the more discovery requests you need to make.
-	// given 25 groups (our groups + a few custom resources) with one-ish version each, discovery needs to make 50 requests
-	// double it just so we don't end up here again for a while.  This config is only used for discovery.
-	config.Burst = 100
-
-	rawDiscoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return nil, err
+	if runningInCluster {
+		// only create a temp dir when we are running in a pod since we never clean it up
+		tempDir, err := ioutil.TempDir("", "pinniped-middleware-discovery-cache")
+		if err != nil {
+			return nil, err
+		}
+		overrideCacheDir = tempDir
 	}
 
-	// TODO kubectl uses this more robust CachedDiscoveryInterface but it relies on file based caching ...
-	//  disk.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, time.Duration(10*time.Minute))
-	discoveryClient := memory.NewMemCacheClient(rawDiscoveryClient)
-
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
-	expander := restmapper.NewShortcutExpander(mapper, discoveryClient)
-	return expander, nil
+	return toRESTMapper(kubeConfig, overrideCacheDir)
 }
