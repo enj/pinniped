@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -79,7 +80,7 @@ type verb string
 
 func (verb) verb() {}
 
-func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, middlewares []Middleware) *restclient.Config {
+func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, mapper meta.RESTMapper, middlewares []Middleware) *restclient.Config {
 	hostURL, apiPathPrefix, err := getHostAndAPIPathPrefix(config)
 	if err != nil {
 		plog.DebugErr("invalid rest config", err)
@@ -128,7 +129,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				return rt.RoundTrip(req) // no middleware wanted to mutate this request
 			}
 
-			switch middlewareReq.Verb() {
+			switch v := middlewareReq.Verb(); v {
 			case VerbCreate, VerbUpdate:
 				if req.GetBody == nil {
 					return nil, fmt.Errorf("unreadible body for request: %#v", middlewareReq) // this should never happen
@@ -199,14 +200,20 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
 
-			case VerbGet:
-				obj := &metav1.PartialObjectMetadata{
-					TypeMeta: metav1.TypeMeta{
-						Kind:       "TODO", // TODO go from GVR to GVK?
-						APIVersion: middlewareReq.Resource().GroupVersion().String(),
-					},
-					// no need to do anything with object meta since we only support GVK changes
+			case VerbGet, VerbList:
+				// TODO maybe we want KindsFor[0]?
+				mapperGVK, err := mapper.KindFor(middlewareReq.Resource())
+				if err != nil {
+					return nil, fmt.Errorf("unable to determine GVK: %#v", middlewareReq)
 				}
+
+				if v == VerbList {
+					mapperGVK.Kind += "List" // this information cannot be determined via discovery
+				}
+
+				// no need to do anything with object meta since we only support GVK changes
+				obj := &metav1.PartialObjectMetadata{}
+				obj.APIVersion, obj.Kind = mapperGVK.ToAPIVersionAndKind()
 
 				result, err := middlewareReq.mutate(obj)
 				if err != nil {
@@ -239,10 +246,6 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				// TODO
 				fallthrough
 
-			case VerbList:
-				// TODO
-				fallthrough
-
 			case VerbWatch:
 				// TODO
 				fallthrough
@@ -254,7 +257,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				return rt.RoundTrip(req) // we only handle certain verbs
 			}
 
-			// TODO log newData at high loglevel similar to REST client
+			// TODO log request and response body at high log level similar to REST client
 		})
 	}
 

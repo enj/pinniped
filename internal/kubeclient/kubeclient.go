@@ -6,10 +6,14 @@ package kubeclient
 import (
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/kubernetes"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 	aggregatorclient "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 	aggregatorclientscheme "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/scheme"
 
@@ -50,14 +54,19 @@ func New(opts ...Option) (*Client, error) {
 	// explicitly use protobuf when talking to built-in kube APIs
 	protoKubeConfig := createProtoKubeConfig(c.config)
 
+	mapper, err := getRESTMapper(protoKubeConfig)
+	if err != nil {
+		return nil, fmt.Errorf("could not initialize REST mapper: %w", err)
+	}
+
 	// Connect to the core Kubernetes API.
-	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, c.middlewares))
+	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, mapper, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
 	}
 
 	// Connect to the Kubernetes aggregation API.
-	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, c.middlewares))
+	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, mapper, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize aggregation client: %w", err)
 	}
@@ -66,7 +75,7 @@ func New(opts ...Option) (*Client, error) {
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
 	// TODO we should try to add protobuf support to TokenCredentialRequests since it is an aggregated API
-	pinnipedConciergeClient, err := pinnipedconciergeclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedconciergeclientsetscheme.Codecs, c.middlewares))
+	pinnipedConciergeClient, err := pinnipedconciergeclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedconciergeclientsetscheme.Codecs, mapper, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
@@ -74,7 +83,7 @@ func New(opts ...Option) (*Client, error) {
 	// Connect to the pinniped supervisor API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedSupervisorClient, err := pinnipedsupervisorclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedsupervisorclientsetscheme.Codecs, c.middlewares))
+	pinnipedSupervisorClient, err := pinnipedsupervisorclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedsupervisorclientsetscheme.Codecs, mapper, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
@@ -107,4 +116,26 @@ func createProtoKubeConfig(kubeConfig *restclient.Config) *restclient.Config {
 	protoKubeConfig.AcceptContentTypes = protoThenJSON
 	protoKubeConfig.ContentType = runtime.ContentTypeProtobuf
 	return protoKubeConfig
+}
+
+func getRESTMapper(kubeConfig *restclient.Config) (meta.RESTMapper, error) {
+	config := restclient.CopyConfig(kubeConfig)
+
+	// The more groups you have, the more discovery requests you need to make.
+	// given 25 groups (our groups + a few custom resources) with one-ish version each, discovery needs to make 50 requests
+	// double it just so we don't end up here again for a while.  This config is only used for discovery.
+	config.Burst = 100
+
+	rawDiscoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO kubectl uses this more robust CachedDiscoveryInterface but it relies on file based caching ...
+	//  disk.NewCachedDiscoveryClientForConfig(config, discoveryCacheDir, httpCacheDir, time.Duration(10*time.Minute))
+	discoveryClient := memory.NewMemCacheClient(rawDiscoveryClient)
+
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
+	expander := restmapper.NewShortcutExpander(mapper, discoveryClient)
+	return expander, nil
 }
