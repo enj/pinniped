@@ -31,7 +31,6 @@ import (
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
 	restclientwatch "k8s.io/client-go/rest/watch"
-	"k8s.io/gengo/namer"
 
 	"go.pinniped.dev/internal/plog"
 )
@@ -63,11 +62,6 @@ type RoundTrip interface {
 type Object interface {
 	runtime.Object // generic access to TypeMeta
 	metav1.Object  // generic access to ObjectMeta
-}
-
-type objectList interface {
-	runtime.Object       // generic access to TypeMeta
-	metav1.ListInterface // generic access to ListMeta
 }
 
 type Verb interface {
@@ -106,22 +100,15 @@ func configWithWrapper(config *restclient.Config, scheme *runtime.Scheme, negoti
 		return config
 	}
 
-	// TODO use these
-	_ = scheme.AllKnownTypes()
-	_ = scheme.ObjectKinds
-	pluralExceptions := map[string]string{"Endpoints": "Endpoints"} // copied from client-gen
-	lowercaseNamer := namer.NewAllLowercasePluralNamer(pluralExceptions)
-
 	info, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), config.ContentType)
 	if !ok {
 		panic(fmt.Errorf("unknown content type: %s ", config.ContentType)) // static input, programmer error
 	}
 	regSerializer := info.Serializer // should perform no conversion
-	streamSerializer := info.StreamSerializer
-
-	_ = streamSerializer // TODO fix watch
 
 	resolver := server.NewRequestInfoResolver(server.NewConfig(serializer.CodecFactory{}))
+
+	schemeRestMapperFunc := schemeRestMapper(scheme)
 
 	f := func(rt http.RoundTripper) http.RoundTripper {
 		return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
@@ -227,14 +214,9 @@ func configWithWrapper(config *restclient.Config, scheme *runtime.Scheme, negoti
 				return handleResponseNewGVK(config, negotiatedSerializer, resp, middlewareReq, result)
 
 			case VerbGet, VerbList, VerbDelete, VerbDeleteCollection, VerbPatch, VerbWatch:
-				// TODO maybe we want KindsFor[0]?
-				mapperGVK, err := mapper.KindFor(middlewareReq.Resource()) // TODO this does not work because the pinniped.dev CRDs wont be installed
-				if err != nil {
-					return nil, fmt.Errorf("unable to determine GVK: %#v", middlewareReq)
-				}
-
-				if v == VerbList {
-					mapperGVK.Kind += "List" // this information cannot be determined via discovery
+				mapperGVK, ok := schemeRestMapperFunc(middlewareReq.Resource(), v)
+				if !ok {
+					return nil, fmt.Errorf("unable to determine GVK for middleware request %#v", middlewareReq)
 				}
 
 				// no need to do anything with object meta since we only support GVK changes
@@ -476,16 +458,6 @@ func handleWatchResponseNewGVK(
 		defer resp.Body.Close()
 		defer newBodyWriter.Close()
 
-		maybeSendErrToReader := func(err error) {
-			if stderrors.Is(err, io.ErrClosedPipe) {
-				return // calling newBodyReader.Close() will send this to all newBodyWriter.Write()
-			}
-
-			// CloseWithError always returns nil
-			// all newBodyReader.Read() will get this error
-			_ = newBodyWriter.CloseWithError(err)
-		}
-
 		frameReader := serializerInfo.StreamSerializer.Framer.NewFrameReader(resp.Body)
 		watchEventDecoder := streaming.NewDecoder(frameReader, serializerInfo.StreamSerializer.Serializer)
 		sourceDecoder := restclientwatch.NewDecoder(watchEventDecoder, &passthroughDecoder{})
@@ -497,7 +469,14 @@ func handleWatchResponseNewGVK(
 		for {
 			ok, err := sendWatchEvent(sourceDecoder, serializerInfo.Serializer, middlewareReq, result, watchEventEncoder)
 			if err != nil {
-				maybeSendErrToReader(err)
+				if stderrors.Is(err, io.ErrClosedPipe) {
+					return // calling newBodyReader.Close() will send this to all newBodyWriter.Write()
+				}
+
+				// CloseWithError always returns nil
+				// all newBodyReader.Read() will get this error
+				_ = newBodyWriter.CloseWithError(err)
+
 				return
 			}
 
@@ -515,7 +494,7 @@ func sendWatchEvent(sourceDecoder watch.Decoder, s runtime.Serializer, middlewar
 	eventType, obj, err := sourceDecoder.Decode()
 	if err != nil {
 		switch err {
-		case io.EOF:
+		case io.EOF: // TODO use errors.Is
 			// watch closed normally
 		case io.ErrUnexpectedEOF:
 			plog.InfoErr("Unexpected EOF during watch stream event decoding", err)
@@ -523,7 +502,7 @@ func sendWatchEvent(sourceDecoder watch.Decoder, s runtime.Serializer, middlewar
 			if net.IsProbableEOF(err) || net.IsTimeout(err) {
 				plog.TraceErr("Unable to decode an event from the watch stream", err)
 			} else {
-				return false, err
+				return false, fmt.Errorf("unexpected watch decode error for %#v: %w", middlewareReq, err)
 			}
 		}
 		return false, nil // all errors end watch
