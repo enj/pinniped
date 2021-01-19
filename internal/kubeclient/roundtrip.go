@@ -493,17 +493,15 @@ func sendWatchEvent(sourceDecoder watch.Decoder, s runtime.Serializer, middlewar
 	// partially copied from watch.NewStreamWatcher.receive
 	eventType, obj, err := sourceDecoder.Decode()
 	if err != nil {
-		switch err {
-		case io.EOF: // TODO use errors.Is
+		switch {
+		case stderrors.Is(err, io.EOF):
 			// watch closed normally
-		case io.ErrUnexpectedEOF:
+		case stderrors.Is(err, io.ErrUnexpectedEOF):
 			plog.InfoErr("Unexpected EOF during watch stream event decoding", err)
+		case net.IsProbableEOF(err), net.IsTimeout(err):
+			plog.TraceErr("Unable to decode an event from the watch stream", err)
 		default:
-			if net.IsProbableEOF(err) || net.IsTimeout(err) {
-				plog.TraceErr("Unable to decode an event from the watch stream", err)
-			} else {
-				return false, fmt.Errorf("unexpected watch decode error for %#v: %w", middlewareReq, err)
-			}
+			return false, fmt.Errorf("unexpected watch decode error for %#v: %w", middlewareReq, err)
 		}
 		return false, nil // all errors end watch
 	}
