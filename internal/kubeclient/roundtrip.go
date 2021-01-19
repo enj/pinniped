@@ -17,6 +17,7 @@ import (
 	"path"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -53,6 +54,7 @@ func (f MiddlewareFunc) Handle(ctx context.Context, rt RoundTrip) {
 type RoundTrip interface {
 	Verb() Verb
 	Namespace() string // this is the only valid way to check namespace, Object.GetNamespace() will almost always be empty
+	NamespaceScoped() bool
 	Resource() schema.GroupVersionResource
 	Subresource() string
 	MutateRequest(f func(obj Object)) // TODO add response mutation support if we come up with a good use case
@@ -318,6 +320,16 @@ func (r *request) Verb() Verb {
 
 func (r *request) Namespace() string {
 	return r.namespace
+}
+
+var namespaceGVR = corev1.SchemeGroupVersion.WithResource("namespaces")
+
+func (r *request) NamespaceScoped() bool {
+	if r.Resource() == namespaceGVR {
+		return false // always consider namespaces to be cluster scoped
+	}
+
+	return len(r.Namespace()) != 0
 }
 
 func (r *request) Resource() schema.GroupVersionResource {
