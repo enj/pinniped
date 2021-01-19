@@ -5,9 +5,7 @@ package kubeclient
 
 import (
 	"fmt"
-	"io/ioutil"
 
-	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	kubescheme "k8s.io/client-go/kubernetes/scheme"
@@ -37,7 +35,6 @@ func New(opts ...Option) (*Client, error) {
 		opt(c)
 	}
 
-	var runningInCluster bool
 	// default to assuming we are running in a pod with the service account token mounted
 	if c.config == nil {
 		inClusterConfig, err := restclient.InClusterConfig()
@@ -45,7 +42,6 @@ func New(opts ...Option) (*Client, error) {
 			return nil, fmt.Errorf("could not load in-cluster configuration: %w", err)
 		}
 		WithConfig(inClusterConfig)(c) // make sure all writes to clientConfig flow through one code path
-		runningInCluster = true
 	}
 
 	// explicitly use json when talking to CRD APIs
@@ -54,19 +50,14 @@ func New(opts ...Option) (*Client, error) {
 	// explicitly use protobuf when talking to built-in kube APIs
 	protoKubeConfig := createProtoKubeConfig(c.config)
 
-	mapper, err := getRESTMapper(protoKubeConfig, runningInCluster)
-	if err != nil {
-		return nil, fmt.Errorf("could not initialize REST mapper: %w", err)
-	}
-
 	// Connect to the core Kubernetes API.
-	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Codecs, mapper, c.middlewares))
+	k8sClient, err := kubernetes.NewForConfig(configWithWrapper(protoKubeConfig, kubescheme.Scheme, kubescheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize Kubernetes client: %w", err)
 	}
 
 	// Connect to the Kubernetes aggregation API.
-	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Codecs, mapper, c.middlewares))
+	aggregatorClient, err := aggregatorclient.NewForConfig(configWithWrapper(protoKubeConfig, aggregatorclientscheme.Scheme, aggregatorclientscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize aggregation client: %w", err)
 	}
@@ -75,7 +66,7 @@ func New(opts ...Option) (*Client, error) {
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
 	// TODO we should try to add protobuf support to TokenCredentialRequests since it is an aggregated API
-	pinnipedConciergeClient, err := pinnipedconciergeclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedconciergeclientsetscheme.Codecs, mapper, c.middlewares))
+	pinnipedConciergeClient, err := pinnipedconciergeclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedconciergeclientsetscheme.Scheme, pinnipedconciergeclientsetscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
@@ -83,7 +74,7 @@ func New(opts ...Option) (*Client, error) {
 	// Connect to the pinniped supervisor API.
 	// We cannot use protobuf encoding here because we are using CRDs
 	// (for which protobuf encoding is not yet supported).
-	pinnipedSupervisorClient, err := pinnipedsupervisorclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedsupervisorclientsetscheme.Codecs, mapper, c.middlewares))
+	pinnipedSupervisorClient, err := pinnipedsupervisorclientset.NewForConfig(configWithWrapper(jsonKubeConfig, pinnipedsupervisorclientsetscheme.Scheme, pinnipedsupervisorclientsetscheme.Codecs, c.middlewares))
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize pinniped client: %w", err)
 	}
@@ -116,19 +107,4 @@ func createProtoKubeConfig(kubeConfig *restclient.Config) *restclient.Config {
 	protoKubeConfig.AcceptContentTypes = protoThenJSON
 	protoKubeConfig.ContentType = runtime.ContentTypeProtobuf
 	return protoKubeConfig
-}
-
-func getRESTMapper(kubeConfig *restclient.Config, runningInCluster bool) (meta.RESTMapper, error) {
-	var overrideCacheDir string // TODO wire to --cache-dir like kubectl if needed
-
-	if runningInCluster {
-		// only create a temp dir when we are running in a pod since we never clean it up
-		tempDir, err := ioutil.TempDir("", "pinniped-middleware-discovery-cache")
-		if err != nil {
-			return nil, err
-		}
-		overrideCacheDir = tempDir
-	}
-
-	return toRESTMapper(kubeConfig, overrideCacheDir)
 }

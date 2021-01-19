@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"mime"
 	"net/http"
@@ -16,14 +17,19 @@ import (
 	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
+	restclientwatch "k8s.io/client-go/rest/watch"
+	"k8s.io/gengo/namer"
 
 	"go.pinniped.dev/internal/plog"
 )
@@ -56,6 +62,11 @@ type Object interface {
 	metav1.Object  // generic access to ObjectMeta
 }
 
+type objectList interface {
+	runtime.Object       // generic access to TypeMeta
+	metav1.ListInterface // generic access to ListMeta
+}
+
 type Verb interface {
 	// TODO check if we need a String() method
 	verb() // private method to prevent creation of verbs outside this package
@@ -80,7 +91,7 @@ type verb string
 
 func (verb) verb() {}
 
-func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, mapper meta.RESTMapper, middlewares []Middleware) *restclient.Config {
+func configWithWrapper(config *restclient.Config, scheme *runtime.Scheme, negotiatedSerializer runtime.NegotiatedSerializer, middlewares []Middleware) *restclient.Config {
 	hostURL, apiPathPrefix, err := getHostAndAPIPathPrefix(config)
 	if err != nil {
 		plog.DebugErr("invalid rest config", err)
@@ -91,6 +102,12 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 	if len(middlewares) == 0 {
 		return config
 	}
+
+	// TODO use these
+	_ = scheme.AllKnownTypes()
+	_ = scheme.ObjectKinds
+	pluralExceptions := map[string]string{"Endpoints": "Endpoints"} // copied from client-gen
+	lowercaseNamer := namer.NewAllLowercasePluralNamer(pluralExceptions)
 
 	info, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), config.ContentType)
 	if !ok {
@@ -148,7 +165,7 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 
 				// attempt to decode with no defaults or into specified, i.e. defer to the decoder
 				// this should result in the a straight decode with no conversion
-				decodedObj, _, err := regSerializer.Decode(data, nil, nil)
+				decodedObj, err := runtime.Decode(regSerializer, data)
 				if err != nil {
 					return nil, fmt.Errorf("body decode failed: %w", err)
 				}
@@ -195,15 +212,20 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				newReq.Body = newReqForBody.Body
 				newReq.GetBody = newReqForBody.GetBody
 
-				if !result.needsPathUpdate {
-					return rt.RoundTrip(newReq) // we did not change the GVK, so we do not need to mess with the incoming data
+				resp, err := rt.RoundTrip(newReq)
+				if err != nil {
+					return nil, fmt.Errorf("middleware request for %#v failed: %w", middlewareReq, err)
 				}
 
-				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
+				if !result.needsPathUpdate {
+					return resp, nil // we did not change the GVK, so we do not need to mess with the incoming data
+				}
 
-			case VerbGet, VerbList, VerbDelete, VerbDeleteCollection, VerbPatch:
+				return handleResponseNewGVK(config, negotiatedSerializer, resp, middlewareReq, result)
+
+			case VerbGet, VerbList, VerbDelete, VerbDeleteCollection, VerbPatch, VerbWatch:
 				// TODO maybe we want KindsFor[0]?
-				mapperGVK, err := mapper.KindFor(middlewareReq.Resource())
+				mapperGVK, err := mapper.KindFor(middlewareReq.Resource()) // TODO this does not work because the pinniped.dev CRDs wont be installed
 				if err != nil {
 					return nil, fmt.Errorf("unable to determine GVK: %#v", middlewareReq)
 				}
@@ -241,16 +263,21 @@ func configWithWrapper(config *restclient.Config, negotiatedSerializer runtime.N
 				// replace the body and path with the new data
 				newReq.URL = reqURL
 
-				switch v {
-				case VerbDelete, VerbDeleteCollection:
-					return rt.RoundTrip(newReq) // we do not need to fix the response on delete
+				resp, err := rt.RoundTrip(newReq)
+				if err != nil {
+					return nil, fmt.Errorf("middleware request for %#v failed: %w", middlewareReq, err)
 				}
 
-				return handleResponseNewGVK(config, negotiatedSerializer, rt, newReq, middlewareReq, result)
+				switch v {
+				case VerbDelete, VerbDeleteCollection:
+					return resp, nil // we do not need to fix the response on delete
 
-			case VerbWatch:
-				// TODO add watch support
-				fallthrough
+				case VerbWatch:
+					return handleWatchResponseNewGVK(config, negotiatedSerializer, resp, middlewareReq, result)
+
+				default:
+					return handleResponseNewGVK(config, negotiatedSerializer, resp, middlewareReq, result)
+				}
 
 			case VerbProxy: // TODO for now we do not support proxy interception
 				fallthrough
@@ -363,16 +390,11 @@ func updatePathNewGVK(reqURL *url.URL, result *mutationResult, apiPathPrefix str
 func handleResponseNewGVK(
 	config *restclient.Config,
 	negotiatedSerializer runtime.NegotiatedSerializer,
-	rt http.RoundTripper,
-	newReq *http.Request,
+	resp *http.Response,
 	middlewareReq *request,
 	result *mutationResult,
 ) (*http.Response, error) {
-	resp, err := rt.RoundTrip(newReq)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-
+	// defer these status codes to client-go
 	switch {
 	case resp.StatusCode == http.StatusSwitchingProtocols,
 		resp.StatusCode < http.StatusOK || resp.StatusCode > http.StatusPartialContent:
@@ -386,28 +408,20 @@ func handleResponseNewGVK(
 
 	_ = resp.Body.Close()
 
-	contentType := resp.Header.Get("Content-Type")
-	if len(contentType) == 0 {
-		contentType = config.ContentType
-	}
-	mediaType, _, err := mime.ParseMediaType(contentType)
+	serializerInfo, err := getSerializerInfo(config, negotiatedSerializer, resp, middlewareReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse content type: %w", err)
-	}
-	respInfo, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), mediaType)
-	if !ok {
-		return nil, fmt.Errorf("unable to find resp serialier for %#v with content-type %s", middlewareReq, mediaType)
+		return nil, err
 	}
 
 	// the body could be an API status, random trash or the actual object we want
 	unknown := &runtime.Unknown{}
-	_, _, _ = respInfo.Serializer.Decode(respData, nil, unknown) // we do not care about the return values
+	_ = runtime.DecodeInto(serializerInfo.Serializer, respData, unknown) // we do not care about the error
 
 	fixedRespData := respData
 	doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != result.newGVK
 
 	if !doesNotNeedGVKFix {
-		gvkFixedData, err := restoreGVK(respInfo.Serializer, unknown, result.origGVK)
+		gvkFixedData, err := restoreGVK(serializerInfo.Serializer, unknown, result.origGVK)
 		if err != nil {
 			return nil, fmt.Errorf("failed to restore GVK: %w", err)
 		}
@@ -419,6 +433,100 @@ func handleResponseNewGVK(
 
 	newResp.Body = ioutil.NopCloser(bytes.NewBuffer(fixedRespData))
 	return newResp, nil
+}
+
+func handleWatchResponseNewGVK(
+	config *restclient.Config,
+	negotiatedSerializer runtime.NegotiatedSerializer,
+	resp *http.Response,
+	middlewareReq *request,
+	result *mutationResult,
+) (*http.Response, error) {
+	// defer non-success cases to client-go
+	if resp.StatusCode != http.StatusOK {
+		return resp, nil
+	}
+
+	var goRoutineStarted bool
+	defer func() {
+		if goRoutineStarted {
+			return
+		}
+		_ = resp.Body.Close() // always close the body if we do not get to the point of starting our go routine
+	}()
+
+	serializerInfo, err := getSerializerInfo(config, negotiatedSerializer, resp, middlewareReq)
+	if err != nil {
+		return nil, err
+	}
+
+	frameReader := serializerInfo.StreamSerializer.Framer.NewFrameReader(resp.Body)
+	watchEventDecoder := streaming.NewDecoder(frameReader, serializerInfo.StreamSerializer.Serializer)
+	sourceDecoder := restclientwatch.NewDecoder(watchEventDecoder, serializerInfo.Serializer) // <- called in for loop to feed chan
+
+	streamWatcher := watch.NewStreamWatcher(
+		sourceDecoder,
+		// use 500 to indicate that the cause of the error is unknown - other error codes
+		// are more specific to HTTP interactions, and set a reason
+		errors.NewClientErrorReporter(http.StatusInternalServerError, string(middlewareReq.Verb().(verb)), "ClientWatchDecoding"),
+	)
+
+	newResp := &http.Response{}
+	*newResp = *resp
+
+	reader, writer := io.Pipe()
+
+	_ = io.ErrClosedPipe // read close
+	_ = io.EOF           // write close
+
+	newResp.Body = reader // TODO
+
+	goRoutineStarted = true
+	go func() {
+		defer resp.Body.Close()
+		defer streamWatcher.Stop()
+		defer utilruntime.HandleCrash()
+
+		for {
+			select {
+			case event, ok := <-streamWatcher.ResultChan():
+				if !ok {
+					return
+				}
+			// TODO
+
+			case <-newResp.Request.Context().Done():
+				return // TODO is this valid?
+
+			case <-newBodyClosed:
+				return
+
+			case <-origBodyClosed:
+				return
+			}
+		}
+	}()
+
+	return newResp, nil
+}
+
+func getSerializerInfo(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, resp *http.Response, middlewareReq *request) (runtime.SerializerInfo, error) {
+	contentType := resp.Header.Get("Content-Type")
+	if len(contentType) == 0 {
+		contentType = config.ContentType
+	}
+
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return runtime.SerializerInfo{}, fmt.Errorf("failed to parse content type for %#v: %w", middlewareReq, err)
+	}
+
+	respInfo, ok := runtime.SerializerInfoForMediaType(negotiatedSerializer.SupportedMediaTypes(), mediaType)
+	if !ok || respInfo.Serializer == nil || respInfo.StreamSerializer == nil || respInfo.StreamSerializer.Serializer == nil || respInfo.StreamSerializer.Framer == nil {
+		return runtime.SerializerInfo{}, fmt.Errorf("unable to find resp serialier for %#v with content-type %s", middlewareReq, mediaType)
+	}
+
+	return respInfo, nil
 }
 
 func getHostAndAPIPathPrefix(config *restclient.Config) (string, string, error) {
