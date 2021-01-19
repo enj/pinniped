@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
 	"k8s.io/apimachinery/pkg/util/net"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
@@ -476,55 +477,67 @@ func handleWatchResponseNewGVK(
 		frameReader := serializerInfo.StreamSerializer.Framer.NewFrameReader(resp.Body)
 		watchEventDecoder := streaming.NewDecoder(frameReader, serializerInfo.StreamSerializer.Serializer)
 		sourceDecoder := restclientwatch.NewDecoder(watchEventDecoder, &passthroughDecoder{})
+		defer sourceDecoder.Close()
 
 		frameWriter := serializerInfo.StreamSerializer.Framer.NewFrameWriter(newBodyWriter)
 		watchEventEncoder := streaming.NewEncoder(frameWriter, serializerInfo.StreamSerializer.Serializer)
 
 		for {
-			// partially copied from watch.NewStreamWatcher.receive
-			eventType, obj, err := sourceDecoder.Decode()
+			ok, err := sendWatchEvent(sourceDecoder, serializerInfo.Serializer, middlewareReq, result, watchEventEncoder)
 			if err != nil {
-				switch err {
-				case io.EOF:
-					// watch closed normally
-				case io.ErrUnexpectedEOF:
-					plog.InfoErr("Unexpected EOF during watch stream event decoding", err)
-				default:
-					if net.IsProbableEOF(err) || net.IsTimeout(err) {
-						plog.TraceErr("Unable to decode an event from the watch stream", err)
-					} else {
-						maybeSendErrToReader(err)
-					}
-				}
-				return // all errors end watch
-			}
-
-			unknown, ok := obj.(*runtime.Unknown)
-			if !ok || len(unknown.Raw) == 0 {
-				maybeSendErrToReader(fmt.Errorf("unexpected decode type: %T", obj))
-				return
-			}
-
-			respData := unknown.Raw
-			fixedRespData, err := maybeRestoreGVK(serializerInfo.Serializer, respData, result)
-			if err != nil {
-				maybeSendErrToReader(fmt.Errorf("unable to restore GVK for %#v: %w", middlewareReq, err))
-				return
-			}
-
-			event := &metav1.WatchEvent{
-				Type:   string(eventType),
-				Object: runtime.RawExtension{Raw: fixedRespData},
-			}
-
-			if err := watchEventEncoder.Encode(event); err != nil {
 				maybeSendErrToReader(err)
+				return
+			}
+
+			if !ok {
 				return
 			}
 		}
 	}()
 
 	return newResp, nil
+}
+
+func sendWatchEvent(sourceDecoder watch.Decoder, s runtime.Serializer, middlewareReq *request, result *mutationResult, watchEventEncoder streaming.Encoder) (bool, error) {
+	// partially copied from watch.NewStreamWatcher.receive
+	eventType, obj, err := sourceDecoder.Decode()
+	if err != nil {
+		switch err {
+		case io.EOF:
+			// watch closed normally
+		case io.ErrUnexpectedEOF:
+			plog.InfoErr("Unexpected EOF during watch stream event decoding", err)
+		default:
+			if net.IsProbableEOF(err) || net.IsTimeout(err) {
+				plog.TraceErr("Unable to decode an event from the watch stream", err)
+			} else {
+				return false, err
+			}
+		}
+		return false, nil // all errors end watch
+	}
+
+	unknown, ok := obj.(*runtime.Unknown)
+	if !ok || len(unknown.Raw) == 0 {
+		return false, fmt.Errorf("unexpected decode type: %T", obj)
+	}
+
+	respData := unknown.Raw
+	fixedRespData, err := maybeRestoreGVK(s, respData, result)
+	if err != nil {
+		return false, fmt.Errorf("unable to restore GVK for %#v: %w", middlewareReq, err)
+	}
+
+	event := &metav1.WatchEvent{
+		Type:   string(eventType),
+		Object: runtime.RawExtension{Raw: fixedRespData},
+	}
+
+	if err := watchEventEncoder.Encode(event); err != nil {
+		return false, fmt.Errorf("failed to encode watch event for %#v: %w", middlewareReq, err)
+	}
+
+	return true, nil
 }
 
 func getSerializerInfo(config *restclient.Config, negotiatedSerializer runtime.NegotiatedSerializer, resp *http.Response, middlewareReq *request) (runtime.SerializerInfo, error) {
