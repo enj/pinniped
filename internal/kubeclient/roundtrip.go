@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -17,14 +18,13 @@ import (
 	"strings"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/runtime/serializer/streaming"
+	"k8s.io/apimachinery/pkg/util/net"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/server"
 	restclient "k8s.io/client-go/rest"
@@ -413,19 +413,9 @@ func handleResponseNewGVK(
 		return nil, err
 	}
 
-	// the body could be an API status, random trash or the actual object we want
-	unknown := &runtime.Unknown{}
-	_ = runtime.DecodeInto(serializerInfo.Serializer, respData, unknown) // we do not care about the error
-
-	fixedRespData := respData
-	doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != result.newGVK
-
-	if !doesNotNeedGVKFix {
-		gvkFixedData, err := restoreGVK(serializerInfo.Serializer, unknown, result.origGVK)
-		if err != nil {
-			return nil, fmt.Errorf("failed to restore GVK: %w", err)
-		}
-		fixedRespData = gvkFixedData
+	fixedRespData, err := maybeRestoreGVK(serializerInfo.Serializer, respData, result)
+	if err != nil {
+		return nil, fmt.Errorf("unable to restore GVK for %#v: %w", middlewareReq, err)
 	}
 
 	newResp := &http.Response{}
@@ -460,48 +450,75 @@ func handleWatchResponseNewGVK(
 		return nil, err
 	}
 
-	frameReader := serializerInfo.StreamSerializer.Framer.NewFrameReader(resp.Body)
-	watchEventDecoder := streaming.NewDecoder(frameReader, serializerInfo.StreamSerializer.Serializer)
-	sourceDecoder := restclientwatch.NewDecoder(watchEventDecoder, serializerInfo.Serializer) // <- called in for loop to feed chan
-
-	streamWatcher := watch.NewStreamWatcher(
-		sourceDecoder,
-		// use 500 to indicate that the cause of the error is unknown - other error codes
-		// are more specific to HTTP interactions, and set a reason
-		errors.NewClientErrorReporter(http.StatusInternalServerError, string(middlewareReq.Verb().(verb)), "ClientWatchDecoding"),
-	)
-
 	newResp := &http.Response{}
 	*newResp = *resp
 
-	reader, writer := io.Pipe()
+	newBodyReader, newBodyWriter := io.Pipe()
 
-	_ = io.ErrClosedPipe // read close
-	_ = io.EOF           // write close
-
-	newResp.Body = reader // TODO
+	newResp.Body = newBodyReader // client-go is responsible for closing this reader
 
 	goRoutineStarted = true
 	go func() {
-		defer resp.Body.Close()
-		defer streamWatcher.Stop()
 		defer utilruntime.HandleCrash()
+		defer resp.Body.Close()
+		defer newBodyWriter.Close()
+
+		maybeSendErrToReader := func(err error) {
+			if stderrors.Is(err, io.ErrClosedPipe) {
+				return // calling newBodyReader.Close() will send this to all newBodyWriter.Write()
+			}
+
+			// CloseWithError always returns nil
+			// all newBodyReader.Read() will get this error
+			_ = newBodyWriter.CloseWithError(err)
+		}
+
+		frameReader := serializerInfo.StreamSerializer.Framer.NewFrameReader(resp.Body)
+		watchEventDecoder := streaming.NewDecoder(frameReader, serializerInfo.StreamSerializer.Serializer)
+		sourceDecoder := restclientwatch.NewDecoder(watchEventDecoder, &passthroughDecoder{})
+
+		frameWriter := serializerInfo.StreamSerializer.Framer.NewFrameWriter(newBodyWriter)
+		watchEventEncoder := streaming.NewEncoder(frameWriter, serializerInfo.StreamSerializer.Serializer)
 
 		for {
-			select {
-			case event, ok := <-streamWatcher.ResultChan():
-				if !ok {
-					return
+			// partially copied from watch.NewStreamWatcher.receive
+			eventType, obj, err := sourceDecoder.Decode()
+			if err != nil {
+				switch err {
+				case io.EOF:
+					// watch closed normally
+				case io.ErrUnexpectedEOF:
+					plog.InfoErr("Unexpected EOF during watch stream event decoding", err)
+				default:
+					if net.IsProbableEOF(err) || net.IsTimeout(err) {
+						plog.TraceErr("Unable to decode an event from the watch stream", err)
+					} else {
+						maybeSendErrToReader(err)
+					}
 				}
-			// TODO
+				return // all errors end watch
+			}
 
-			case <-newResp.Request.Context().Done():
-				return // TODO is this valid?
-
-			case <-newBodyClosed:
+			unknown, ok := obj.(*runtime.Unknown)
+			if !ok || len(unknown.Raw) == 0 {
+				maybeSendErrToReader(fmt.Errorf("unexpected decode type: %T", obj))
 				return
+			}
 
-			case <-origBodyClosed:
+			respData := unknown.Raw
+			fixedRespData, err := maybeRestoreGVK(serializerInfo.Serializer, respData, result)
+			if err != nil {
+				maybeSendErrToReader(fmt.Errorf("unable to restore GVK for %#v: %w", middlewareReq, err))
+				return
+			}
+
+			event := &metav1.WatchEvent{
+				Type:   string(eventType),
+				Object: runtime.RawExtension{Raw: fixedRespData},
+			}
+
+			if err := watchEventEncoder.Encode(event); err != nil {
+				maybeSendErrToReader(err)
 				return
 			}
 		}
@@ -565,6 +582,20 @@ func reqWithoutPrefix(req *http.Request, hostURL, apiPathPrefix string) *http.Re
 	reqCopy.URL = urlCopy
 
 	return reqCopy
+}
+
+func maybeRestoreGVK(s runtime.Serializer, respData []byte, result *mutationResult) ([]byte, error) {
+	// the body could be an API status, random trash or the actual object we want
+	unknown := &runtime.Unknown{}
+	_ = runtime.DecodeInto(s, respData, unknown) // we do not care about the error
+
+	doesNotNeedGVKFix := len(unknown.Raw) == 0 || unknown.GroupVersionKind() != result.newGVK
+
+	if doesNotNeedGVKFix {
+		return respData, nil
+	}
+
+	return restoreGVK(s, unknown, result.origGVK)
 }
 
 func restoreGVK(encoder runtime.Encoder, unknown *runtime.Unknown, gvk schema.GroupVersionKind) ([]byte, error) {
