@@ -8,6 +8,8 @@ import (
 )
 
 // WhoAmIRequest submits a request to echo back the current authenticated user.
+// +genclient
+// +genclient:nonNamespaced
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type WhoAmIRequest struct {
 	metav1.TypeMeta   `json:",inline"`

@@ -10,6 +10,7 @@ import (
 
 	v1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/authentication/v1alpha1"
 	configv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/config/v1alpha1"
+	identityv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
 	loginv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/login/v1alpha1"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	cache "k8s.io/client-go/tools/cache"
@@ -50,6 +51,10 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		// Group=config.concierge.pinniped.dev, Version=v1alpha1
 	case configv1alpha1.SchemeGroupVersion.WithResource("credentialissuers"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Config().V1alpha1().CredentialIssuers().Informer()}, nil
+
+		// Group=identity.concierge.pinniped.dev, Version=v1alpha1
+	case identityv1alpha1.SchemeGroupVersion.WithResource("whoamirequests"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Identity().V1alpha1().WhoAmIRequests().Informer()}, nil
 
 		// Group=login.concierge.pinniped.dev, Version=v1alpha1
 	case loginv1alpha1.SchemeGroupVersion.WithResource("tokencredentialrequests"):

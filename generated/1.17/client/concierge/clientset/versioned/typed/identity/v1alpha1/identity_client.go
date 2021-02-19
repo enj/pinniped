@@ -13,11 +13,16 @@ import (
 
 type IdentityV1alpha1Interface interface {
 	RESTClient() rest.Interface
+	WhoAmIRequestsGetter
 }
 
 // IdentityV1alpha1Client is used to interact with features provided by the identity.concierge.pinniped.dev group.
 type IdentityV1alpha1Client struct {
 	restClient rest.Interface
+}
+
+func (c *IdentityV1alpha1Client) WhoAmIRequests() WhoAmIRequestInterface {
+	return newWhoAmIRequests(c)
 }
 
 // NewForConfig creates a new IdentityV1alpha1Client for the given config.
