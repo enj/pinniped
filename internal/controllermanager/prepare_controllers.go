@@ -15,6 +15,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2/klogr"
 
+	identityv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
 	loginv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/login/v1alpha1"
 	pinnipedclientset "go.pinniped.dev/generated/latest/client/concierge/clientset/versioned"
 	pinnipedinformers "go.pinniped.dev/generated/latest/client/concierge/informers/externalversions"
@@ -85,18 +86,24 @@ type Config struct {
 // Prepare the controllers and their informers and return a function that will start them when called.
 //nolint:funlen // Eh, fair, it is a really long function...but it is wiring the world...so...
 func PrepareControllers(c *Config) (func(ctx context.Context), error) {
-	groupName, ok := groupsuffix.Replace(loginv1alpha1.GroupName, c.APIGroupSuffix)
+	loginConciergeAPIGroup, ok := groupsuffix.Replace(loginv1alpha1.GroupName, c.APIGroupSuffix)
 	if !ok {
 		return nil, fmt.Errorf("cannot make api group from %s/%s", loginv1alpha1.GroupName, c.APIGroupSuffix)
 	}
-	apiServiceName := loginv1alpha1.SchemeGroupVersion.Version + "." + groupName
+	loginConciergeAPIServiceName := loginv1alpha1.SchemeGroupVersion.Version + "." + loginConciergeAPIGroup
+
+	identityConciergeAPIGroup, ok := groupsuffix.Replace(identityv1alpha1.GroupName, c.APIGroupSuffix)
+	if !ok {
+		return nil, fmt.Errorf("cannot make api group from %s/%s", identityv1alpha1.GroupName, c.APIGroupSuffix)
+	}
+	identityConciergeAPIServiceName := identityv1alpha1.SchemeGroupVersion.Version + "." + identityConciergeAPIGroup
 
 	dref, _, err := deploymentref.New(c.ServerInstallationInfo)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create deployment ref: %w", err)
 	}
 
-	apiServiceRef, err := apiserviceref.New(apiServiceName)
+	apiServiceRef, err := apiserviceref.New(loginConciergeAPIServiceName)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create API service ref: %w", err)
 	}
@@ -163,7 +170,18 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 			apicerts.NewAPIServiceUpdaterController(
 				c.ServerInstallationInfo.Namespace,
 				c.NamesConfig.ServingCertificateSecret,
-				apiServiceName,
+				loginConciergeAPIServiceName,
+				client.Aggregation,
+				informers.installationNamespaceK8s.Core().V1().Secrets(),
+				controllerlib.WithInformer,
+			),
+			singletonWorker,
+		).
+		WithController(
+			apicerts.NewAPIServiceUpdaterController(
+				c.ServerInstallationInfo.Namespace,
+				c.NamesConfig.ServingCertificateSecret,
+				identityConciergeAPIServiceName,
 				client.Aggregation,
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
 				controllerlib.WithInformer,
