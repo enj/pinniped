@@ -19,6 +19,8 @@ import (
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 
+	identityapi "go.pinniped.dev/generated/latest/apis/concierge/identity"
+	identityv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
 	loginapi "go.pinniped.dev/generated/latest/apis/concierge/login"
 	loginv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/login/v1alpha1"
 	"go.pinniped.dev/internal/certauthority/dynamiccertauthority"
@@ -228,13 +230,22 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, log
 	if apiGroupSuffix == "pinniped.dev" {
 		utilruntime.Must(loginv1alpha1.AddToScheme(scheme))
 		utilruntime.Must(loginapi.AddToScheme(scheme))
-		return scheme, loginv1alpha1.SchemeGroupVersion, nil
+		utilruntime.Must(identityv1alpha1.AddToScheme(scheme))
+		utilruntime.Must(identityapi.AddToScheme(scheme))
+		return scheme, loginv1alpha1.SchemeGroupVersion, identityv1alpha1.SchemeGroupVersion
 	}
 
 	loginConciergeAPIGroup, ok := groupsuffix.Replace(loginv1alpha1.GroupName, apiGroupSuffix)
 	if !ok {
 		panic(fmt.Errorf("cannot make api group from %s/%s", loginv1alpha1.GroupName, apiGroupSuffix)) // static input, impossible case
 	}
+
+	identityConciergeAPIGroup, ok := groupsuffix.Replace(identityv1alpha1.GroupName, apiGroupSuffix)
+	if !ok {
+		panic(fmt.Errorf("cannot make api group from %s/%s", identityv1alpha1.GroupName, apiGroupSuffix)) // static input, impossible case
+	}
+
+	// TODO update tmp scheme with identity group logic
 
 	// we need a temporary place to register our types to avoid double registering them
 	tmpScheme := runtime.NewScheme()
@@ -307,5 +318,7 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, log
 		credentialRequest.Spec.Authenticator.APIGroup = &restoredGroup
 	})
 
-	return scheme, schema.GroupVersion{Group: loginConciergeAPIGroup, Version: loginv1alpha1.SchemeGroupVersion.Version}, nil
+	return scheme,
+		schema.GroupVersion{Group: loginConciergeAPIGroup, Version: loginv1alpha1.SchemeGroupVersion.Version},
+		schema.GroupVersion{Group: identityConciergeAPIGroup, Version: identityv1alpha1.SchemeGroupVersion.Version}
 }
