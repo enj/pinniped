@@ -174,7 +174,7 @@ func getAggregatedAPIServerConfig(
 	startControllersPostStartHook func(context.Context),
 	apiGroupSuffix string,
 ) (*apiserver.Config, error) {
-	scheme, groupVersion := getAggregatedAPIServerScheme(apiGroupSuffix)
+	scheme, loginConciergeGroupVersion, identityConciergeGroupVersion := getAggregatedAPIServerScheme(apiGroupSuffix)
 	codecs := serializer.NewCodecFactory(scheme)
 
 	// this is unused for now but it is a safe value that we could use in the future
@@ -182,7 +182,7 @@ func getAggregatedAPIServerConfig(
 
 	recommendedOptions := genericoptions.NewRecommendedOptions(
 		defaultEtcdPathPrefix,
-		codecs.LegacyCodec(groupVersion),
+		codecs.LegacyCodec(loginConciergeGroupVersion, identityConciergeGroupVersion),
 	)
 	recommendedOptions.Etcd = nil // turn off etcd storage because we don't need it yet
 	recommendedOptions.SecureServing.ServerCert.GeneratedCert = dynamicCertProvider
@@ -210,13 +210,14 @@ func getAggregatedAPIServerConfig(
 			StartControllersPostStartHook: startControllersPostStartHook,
 			Scheme:                        scheme,
 			NegotiatedSerializer:          codecs,
-			GroupVersion:                  groupVersion,
+			LoginConciergeGroupVersion:    loginConciergeGroupVersion,
+			IdentityConciergeGroupVersion: identityConciergeGroupVersion,
 		},
 	}
 	return apiServerConfig, nil
 }
 
-func getAggregatedAPIServerScheme(apiGroupSuffix string) (*runtime.Scheme, schema.GroupVersion) {
+func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, login, identity schema.GroupVersion) {
 	// standard set up of the server side scheme
 	scheme := runtime.NewScheme()
 
@@ -227,7 +228,7 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (*runtime.Scheme, schem
 	if apiGroupSuffix == "pinniped.dev" {
 		utilruntime.Must(loginv1alpha1.AddToScheme(scheme))
 		utilruntime.Must(loginapi.AddToScheme(scheme))
-		return scheme, loginv1alpha1.SchemeGroupVersion
+		return scheme, loginv1alpha1.SchemeGroupVersion, nil
 	}
 
 	loginConciergeAPIGroup, ok := groupsuffix.Replace(loginv1alpha1.GroupName, apiGroupSuffix)
@@ -306,5 +307,5 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (*runtime.Scheme, schem
 		credentialRequest.Spec.Authenticator.APIGroup = &restoredGroup
 	})
 
-	return scheme, schema.GroupVersion{Group: loginConciergeAPIGroup, Version: loginv1alpha1.SchemeGroupVersion.Version}
+	return scheme, schema.GroupVersion{Group: loginConciergeAPIGroup, Version: loginv1alpha1.SchemeGroupVersion.Version}, nil
 }
