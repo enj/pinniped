@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -15,8 +16,9 @@ import (
 	"go.pinniped.dev/test/library"
 )
 
-func TestWhoAmIKubeadm(t *testing.T) {
+func TestWhoAmI_Kubeadm(t *testing.T) {
 	// use the cluster signing key being available as a proxy for this being a kubeadm cluster
+	// we should add more robust logic around skipping clusters based on vendor
 	_ = library.IntegrationEnv(t).WithCapability(library.ClusterSigningKeyIsAvailable)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -45,7 +47,7 @@ func TestWhoAmIKubeadm(t *testing.T) {
 	)
 }
 
-func TestWhoAmIServiceAccount(t *testing.T) {
+func TestWhoAmI_ServiceAccount(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -117,4 +119,66 @@ func TestWhoAmIServiceAccount(t *testing.T) {
 		},
 		whoAmI,
 	)
+
+	// placeholder to test against token request when it is supported
+	tokenRequest, err := kubeClient.ServiceAccounts(ns.Name).CreateToken(ctx, sa.Name, &authenticationv1.TokenRequest{
+		Spec: authenticationv1.TokenRequestSpec{
+			Audiences: []string{"should-fail"},
+			BoundObjectRef: &authenticationv1.BoundObjectReference{
+				Kind:       "Secret",
+				APIVersion: "",
+				Name:       secret.Name,
+				UID:        secret.UID,
+			},
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Nil(t, tokenRequest)
+}
+
+func TestWhoAmI_CSR(t *testing.T) {
+	// use the cluster signing key being available as a proxy for this not being an EKS cluster
+	// we should add more robust logic around skipping clusters based on vendor
+	_ = library.IntegrationEnv(t).WithCapability(library.ClusterSigningKeyIsAvailable)
+
+}
+
+func TestWhoAmI_Anonymous(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	anonymousConfig := library.NewAnonymousClientRestConfig(t)
+
+	whoAmI, err := library.NewKubeclient(t, anonymousConfig).PinnipedConcierge.IdentityV1alpha1().WhoAmIRequests().
+		Create(ctx, &v1alpha1.WhoAmIRequest{}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	// this also asserts that all users, even unauthenticated ones, can call this API when anonymous is enabled
+	// this test will need to be skipped when we start running the integration tests against AKS clusters
+	require.Equal(t,
+		&v1alpha1.WhoAmIRequest{
+			Status: v1alpha1.WhoAmIRequestStatus{
+				KubernetesUserInfo: v1alpha1.KubernetesUserInfo{
+					User: v1alpha1.UserInfo{
+						Username: "system:anonymous",
+						Groups: []string{
+							"system:unauthenticated",
+						},
+					},
+				},
+			},
+		},
+		whoAmI,
+	)
+}
+
+func TestWhoAmI_ImpersonateDirectly(t *testing.T) {
+	// without system:authenticated should fail
+	// with system:authenticated should work
+	// can impersonate extra and groups
+}
+
+func TestWhoAmI_ImpersonateViaProxy(t *testing.T) {
+	// TODO: add this test after the impersonation proxy is done
+	//  this should test all forms of auth understood by the proxy
 }

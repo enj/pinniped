@@ -133,17 +133,25 @@ echo "generating API-related code for our internal API groups..."
 echo "tidying ${OUTPUT_DIR}/apis/go.mod..."
 (cd apis && go mod tidy 2>&1 | sed "s|^|go-mod-tidy > |")
 
-# Generate client code for our public API groups
+# Generate client code for our public API groups (skip informers for virtual APIs)
 echo "generating client code for our public API groups..."
 (cd client &&
     bash "${GOPATH}/src/k8s.io/code-generator/generate-groups.sh" \
         client,lister,informer \
         "${BASE_PKG}/generated/${KUBE_MINOR_VERSION}/client/concierge" \
         "${BASE_PKG}/generated/${KUBE_MINOR_VERSION}/apis" \
-        "concierge/config:v1alpha1 concierge/authentication:v1alpha1 concierge/login:v1alpha1 concierge/identity:v1alpha1" \
+        "concierge/config:v1alpha1 concierge/authentication:v1alpha1" \
         --go-header-file "${ROOT}/hack/boilerplate.go.txt"  2>&1 | sed "s|^|gen-client > |"
 )
-  (cd client &&
+(cd client &&
+    bash "${GOPATH}/src/k8s.io/code-generator/generate-groups.sh" \
+        client \
+        "${BASE_PKG}/generated/${KUBE_MINOR_VERSION}/client/concierge" \
+        "${BASE_PKG}/generated/${KUBE_MINOR_VERSION}/apis" \
+        "concierge/login:v1alpha1 concierge/identity:v1alpha1" \
+        --go-header-file "${ROOT}/hack/boilerplate.go.txt"  2>&1 | sed "s|^|gen-client > |"
+)
+(cd client &&
     bash "${GOPATH}/src/k8s.io/code-generator/generate-groups.sh" \
         client,lister,informer \
         "${BASE_PKG}/generated/${KUBE_MINOR_VERSION}/client/supervisor" \
