@@ -13,9 +13,7 @@ import (
 	versioned "go.pinniped.dev/generated/1.17/client/concierge/clientset/versioned"
 	authentication "go.pinniped.dev/generated/1.17/client/concierge/informers/externalversions/authentication"
 	config "go.pinniped.dev/generated/1.17/client/concierge/informers/externalversions/config"
-	identity "go.pinniped.dev/generated/1.17/client/concierge/informers/externalversions/identity"
 	internalinterfaces "go.pinniped.dev/generated/1.17/client/concierge/informers/externalversions/internalinterfaces"
-	login "go.pinniped.dev/generated/1.17/client/concierge/informers/externalversions/login"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -164,8 +162,6 @@ type SharedInformerFactory interface {
 
 	Authentication() authentication.Interface
 	Config() config.Interface
-	Identity() identity.Interface
-	Login() login.Interface
 }
 
 func (f *sharedInformerFactory) Authentication() authentication.Interface {
@@ -174,12 +170,4 @@ func (f *sharedInformerFactory) Authentication() authentication.Interface {
 
 func (f *sharedInformerFactory) Config() config.Interface {
 	return config.New(f, f.namespace, f.tweakListOptions)
-}
-
-func (f *sharedInformerFactory) Identity() identity.Interface {
-	return identity.New(f, f.namespace, f.tweakListOptions)
-}
-
-func (f *sharedInformerFactory) Login() login.Interface {
-	return login.New(f, f.namespace, f.tweakListOptions)
 }

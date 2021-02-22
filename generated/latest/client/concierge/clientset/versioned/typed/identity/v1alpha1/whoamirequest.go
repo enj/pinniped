@@ -7,13 +7,10 @@ package v1alpha1
 
 import (
 	"context"
-	"time"
 
 	v1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
 	scheme "go.pinniped.dev/generated/latest/client/concierge/clientset/versioned/scheme"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
 	rest "k8s.io/client-go/rest"
 )
 
@@ -26,14 +23,6 @@ type WhoAmIRequestsGetter interface {
 // WhoAmIRequestInterface has methods to work with WhoAmIRequest resources.
 type WhoAmIRequestInterface interface {
 	Create(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.CreateOptions) (*v1alpha1.WhoAmIRequest, error)
-	Update(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.UpdateOptions) (*v1alpha1.WhoAmIRequest, error)
-	UpdateStatus(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.UpdateOptions) (*v1alpha1.WhoAmIRequest, error)
-	Delete(ctx context.Context, name string, opts v1.DeleteOptions) error
-	DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error
-	Get(ctx context.Context, name string, opts v1.GetOptions) (*v1alpha1.WhoAmIRequest, error)
-	List(ctx context.Context, opts v1.ListOptions) (*v1alpha1.WhoAmIRequestList, error)
-	Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error)
-	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *v1alpha1.WhoAmIRequest, err error)
 	WhoAmIRequestExpansion
 }
 
@@ -49,48 +38,6 @@ func newWhoAmIRequests(c *IdentityV1alpha1Client) *whoAmIRequests {
 	}
 }
 
-// Get takes name of the whoAmIRequest, and returns the corresponding whoAmIRequest object, and an error if there is any.
-func (c *whoAmIRequests) Get(ctx context.Context, name string, options v1.GetOptions) (result *v1alpha1.WhoAmIRequest, err error) {
-	result = &v1alpha1.WhoAmIRequest{}
-	err = c.client.Get().
-		Resource("whoamirequests").
-		Name(name).
-		VersionedParams(&options, scheme.ParameterCodec).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// List takes label and field selectors, and returns the list of WhoAmIRequests that match those selectors.
-func (c *whoAmIRequests) List(ctx context.Context, opts v1.ListOptions) (result *v1alpha1.WhoAmIRequestList, err error) {
-	var timeout time.Duration
-	if opts.TimeoutSeconds != nil {
-		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
-	}
-	result = &v1alpha1.WhoAmIRequestList{}
-	err = c.client.Get().
-		Resource("whoamirequests").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Watch returns a watch.Interface that watches the requested whoAmIRequests.
-func (c *whoAmIRequests) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	var timeout time.Duration
-	if opts.TimeoutSeconds != nil {
-		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
-	}
-	opts.Watch = true
-	return c.client.Get().
-		Resource("whoamirequests").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Watch(ctx)
-}
-
 // Create takes the representation of a whoAmIRequest and creates it.  Returns the server's representation of the whoAmIRequest, and an error, if there is any.
 func (c *whoAmIRequests) Create(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.CreateOptions) (result *v1alpha1.WhoAmIRequest, err error) {
 	result = &v1alpha1.WhoAmIRequest{}
@@ -98,73 +45,6 @@ func (c *whoAmIRequests) Create(ctx context.Context, whoAmIRequest *v1alpha1.Who
 		Resource("whoamirequests").
 		VersionedParams(&opts, scheme.ParameterCodec).
 		Body(whoAmIRequest).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Update takes the representation of a whoAmIRequest and updates it. Returns the server's representation of the whoAmIRequest, and an error, if there is any.
-func (c *whoAmIRequests) Update(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.UpdateOptions) (result *v1alpha1.WhoAmIRequest, err error) {
-	result = &v1alpha1.WhoAmIRequest{}
-	err = c.client.Put().
-		Resource("whoamirequests").
-		Name(whoAmIRequest.Name).
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(whoAmIRequest).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// UpdateStatus was generated because the type contains a Status member.
-// Add a +genclient:noStatus comment above the type to avoid generating UpdateStatus().
-func (c *whoAmIRequests) UpdateStatus(ctx context.Context, whoAmIRequest *v1alpha1.WhoAmIRequest, opts v1.UpdateOptions) (result *v1alpha1.WhoAmIRequest, err error) {
-	result = &v1alpha1.WhoAmIRequest{}
-	err = c.client.Put().
-		Resource("whoamirequests").
-		Name(whoAmIRequest.Name).
-		SubResource("status").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(whoAmIRequest).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Delete takes name of the whoAmIRequest and deletes it. Returns an error if one occurs.
-func (c *whoAmIRequests) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	return c.client.Delete().
-		Resource("whoamirequests").
-		Name(name).
-		Body(&opts).
-		Do(ctx).
-		Error()
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *whoAmIRequests) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	var timeout time.Duration
-	if listOpts.TimeoutSeconds != nil {
-		timeout = time.Duration(*listOpts.TimeoutSeconds) * time.Second
-	}
-	return c.client.Delete().
-		Resource("whoamirequests").
-		VersionedParams(&listOpts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Body(&opts).
-		Do(ctx).
-		Error()
-}
-
-// Patch applies the patch and returns the patched whoAmIRequest.
-func (c *whoAmIRequests) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *v1alpha1.WhoAmIRequest, err error) {
-	result = &v1alpha1.WhoAmIRequest{}
-	err = c.client.Patch(pt).
-		Resource("whoamirequests").
-		Name(name).
-		SubResource(subresources...).
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(data).
 		Do(ctx).
 		Into(result)
 	return
