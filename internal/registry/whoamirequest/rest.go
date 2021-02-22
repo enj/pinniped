@@ -88,8 +88,7 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 		}
 	}
 
-	namespace := genericapirequest.NamespaceValue(ctx)
-	if len(namespace) != 0 {
+	if namespace := genericapirequest.NamespaceValue(ctx); len(namespace) != 0 {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("namespace is not allowed on WhoAmIRequest: %v", namespace))
 	}
 
@@ -113,13 +112,16 @@ func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation 
 					Username: userInfo.GetName(),
 					UID:      userInfo.GetUID(),
 					Groups:   userInfo.GetGroups(),
-					Extra:    map[string]identityapi.ExtraValue{},
 				},
 				Audiences: auds,
 			},
 		},
 	}
 	for k, v := range userInfo.GetExtra() {
+		if out.Status.KubernetesUserInfo.User.Extra == nil {
+			out.Status.KubernetesUserInfo.User.Extra = map[string]identityapi.ExtraValue{}
+		}
+
 		// this assumes no one is putting secret data in the extra field
 		// I think this is a safe assumption since it would leak into audit logs
 		out.Status.KubernetesUserInfo.User.Extra[k] = v

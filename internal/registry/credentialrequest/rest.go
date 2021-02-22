@@ -158,8 +158,8 @@ func validateRequest(ctx context.Context, obj runtime.Object, createValidation r
 		}
 	}
 
-	namespace := genericapirequest.NamespaceValue(ctx)
-	if len(namespace) != 0 {
+	if namespace := genericapirequest.NamespaceValue(ctx); len(namespace) != 0 {
+		traceValidationFailure(t, "namespace is not allowed")
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("namespace is not allowed on TokenCredentialRequest: %v", namespace))
 	}
 
