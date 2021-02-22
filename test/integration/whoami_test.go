@@ -19,6 +19,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/cert"
 	"k8s.io/client-go/util/certificate/csr"
 	"k8s.io/client-go/util/keyutil"
@@ -366,11 +367,68 @@ func TestWhoAmI_Anonymous(t *testing.T) {
 }
 
 func TestWhoAmI_ImpersonateDirectly(t *testing.T) {
-	// without system:authenticated should fail
-	// with system:authenticated should work
-	// can impersonate extra and groups
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	// TODO finish
+	impersonationConfig := library.NewClientConfig(t)
+	impersonationConfig.Impersonate = rest.ImpersonationConfig{
+		UserName: "solaire",
+		Groups:   []string{"astora", "lordran"},
+		Extra: map[string][]string{
+			"covenant": {"warrior-of-sunlight"},
+			"loves":    {"sun", "co-op"},
+		},
+	}
+
+	whoAmI, err := library.NewKubeclient(t, impersonationConfig).PinnipedConcierge.IdentityV1alpha1().WhoAmIRequests().
+		Create(ctx, &identityv1alpha1.WhoAmIRequest{}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t,
+		&identityv1alpha1.WhoAmIRequest{
+			Status: identityv1alpha1.WhoAmIRequestStatus{
+				KubernetesUserInfo: identityv1alpha1.KubernetesUserInfo{
+					User: identityv1alpha1.UserInfo{
+						Username: "solaire",
+						UID:      "", // no way to impersonate UID: https://github.com/kubernetes/kubernetes/issues/93699
+						Groups: []string{
+							"astora",
+							"lordran",
+							"system:authenticated", // impersonation will add this implicitly
+						},
+						Extra: map[string]identityv1alpha1.ExtraValue{
+							"covenant": {"warrior-of-sunlight"},
+							"loves":    {"sun", "co-op"},
+						},
+					},
+				},
+			},
+		},
+		whoAmI,
+	)
+
+	impersonationAnonymousConfig := library.NewClientConfig(t)
+	impersonationAnonymousConfig.Impersonate.UserName = "system:anonymous"
+
+	whoAmIAnonymous, err := library.NewKubeclient(t, impersonationAnonymousConfig).PinnipedConcierge.IdentityV1alpha1().WhoAmIRequests().
+		Create(ctx, &identityv1alpha1.WhoAmIRequest{}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t,
+		&identityv1alpha1.WhoAmIRequest{
+			Status: identityv1alpha1.WhoAmIRequestStatus{
+				KubernetesUserInfo: identityv1alpha1.KubernetesUserInfo{
+					User: identityv1alpha1.UserInfo{
+						Username: "system:anonymous",
+						Groups: []string{
+							"system:unauthenticated", // impersonation will add this implicitly
+						},
+					},
+				},
+			},
+		},
+		whoAmIAnonymous,
+	)
 }
 
 func TestWhoAmI_ImpersonateViaProxy(t *testing.T) {
