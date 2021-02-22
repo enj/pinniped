@@ -227,7 +227,7 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, log
 	metav1.AddToGroupVersion(scheme, metav1.Unversioned)
 
 	// nothing fancy is required if using the standard group suffix
-	if apiGroupSuffix == "pinniped.dev" {
+	if apiGroupSuffix == groupsuffix.PinnipedDefaultSuffix {
 		schemeBuilder := runtime.NewSchemeBuilder(
 			loginv1alpha1.AddToScheme,
 			loginapi.AddToScheme,
