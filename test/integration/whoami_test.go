@@ -4,14 +4,24 @@ package integration
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	certificatesv1 "k8s.io/api/certificates/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/cert"
+	"k8s.io/client-go/util/certificate/csr"
+	"k8s.io/client-go/util/keyutil"
 
 	identityv1alpha1 "go.pinniped.dev/generated/latest/apis/concierge/identity/v1alpha1"
 	"go.pinniped.dev/test/library"
@@ -242,7 +252,88 @@ func TestWhoAmI_CSR(t *testing.T) {
 	// we should add more robust logic around skipping clusters based on vendor
 	_ = library.IntegrationEnv(t).WithCapability(library.ClusterSigningKeyIsAvailable)
 
-	// TODO finish
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	kubeClient := library.NewKubernetesClientset(t)
+
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	der, err := x509.MarshalECPrivateKey(privateKey)
+	require.NoError(t, err)
+
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: keyutil.ECPrivateKeyBlockType, Bytes: der})
+
+	csrPEM, err := cert.MakeCSR(privateKey, &pkix.Name{
+		CommonName:   "panda-man",
+		Organization: []string{"living-the-dream", "need-more-sleep"},
+	}, nil, nil)
+	require.NoError(t, err)
+
+	csrName, csrUID, err := csr.RequestCertificate(
+		kubeClient,
+		csrPEM,
+		"",
+		certificatesv1.KubeAPIServerClientSignerName,
+		[]certificatesv1.KeyUsage{certificatesv1.UsageClientAuth},
+		privateKey,
+	)
+	require.NoError(t, err)
+
+	defer func() {
+		if t.Failed() {
+			return
+		}
+		err := kubeClient.CertificatesV1().CertificateSigningRequests().Delete(ctx, csrName, metav1.DeleteOptions{})
+		require.NoError(t, err)
+	}()
+
+	// this is a blind update with no resource version checks, which is only safe during tests
+	_, err = kubeClient.CertificatesV1().CertificateSigningRequests().UpdateApproval(ctx, csrName, &certificatesv1.CertificateSigningRequest{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: csrName,
+		},
+		Status: certificatesv1.CertificateSigningRequestStatus{
+			Conditions: []certificatesv1.CertificateSigningRequestCondition{
+				{
+					Type:   certificatesv1.CertificateApproved,
+					Status: corev1.ConditionTrue,
+					Reason: "WhoAmICSRTest",
+				},
+			},
+		},
+	}, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	crtPEM, err := csr.WaitForCertificate(ctx, kubeClient, csrName, csrUID)
+	require.NoError(t, err)
+
+	csrConfig := library.NewAnonymousClientRestConfig(t)
+	csrConfig.CertData = crtPEM
+	csrConfig.KeyData = keyPEM
+
+	whoAmI, err := library.NewKubeclient(t, csrConfig).PinnipedConcierge.IdentityV1alpha1().WhoAmIRequests().
+		Create(ctx, &identityv1alpha1.WhoAmIRequest{}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	require.Equal(t,
+		&identityv1alpha1.WhoAmIRequest{
+			Status: identityv1alpha1.WhoAmIRequestStatus{
+				KubernetesUserInfo: identityv1alpha1.KubernetesUserInfo{
+					User: identityv1alpha1.UserInfo{
+						Username: "panda-man",
+						Groups: []string{
+							"need-more-sleep",
+							"living-the-dream",
+							"system:authenticated",
+						},
+					},
+				},
+			},
+		},
+		whoAmI,
+	)
 }
 
 func TestWhoAmI_Anonymous(t *testing.T) {
