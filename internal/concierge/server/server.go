@@ -238,18 +238,10 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, log
 		return scheme, loginv1alpha1.SchemeGroupVersion, identityv1alpha1.SchemeGroupVersion
 	}
 
-	loginConciergeAPIGroup, ok := groupsuffix.Replace(loginv1alpha1.GroupName, apiGroupSuffix)
-	if !ok {
-		panic(fmt.Errorf("cannot make api group from %s/%s", loginv1alpha1.GroupName, apiGroupSuffix)) // static input, impossible case
-	}
+	loginConciergeGroupData, identityConciergeGroupData := groupsuffix.ConciergeGroups(apiGroupSuffix)
 
-	identityConciergeAPIGroup, ok := groupsuffix.Replace(identityv1alpha1.GroupName, apiGroupSuffix)
-	if !ok {
-		panic(fmt.Errorf("cannot make api group from %s/%s", identityv1alpha1.GroupName, apiGroupSuffix)) // static input, impossible case
-	}
-
-	addToSchemeAtNewGroup(scheme, loginv1alpha1.GroupName, loginConciergeAPIGroup, loginv1alpha1.AddToScheme, loginapi.AddToScheme)
-	addToSchemeAtNewGroup(scheme, identityv1alpha1.GroupName, identityConciergeAPIGroup, identityv1alpha1.AddToScheme, identityapi.AddToScheme)
+	addToSchemeAtNewGroup(scheme, loginv1alpha1.GroupName, loginConciergeGroupData.Group, loginv1alpha1.AddToScheme, loginapi.AddToScheme)
+	addToSchemeAtNewGroup(scheme, identityv1alpha1.GroupName, identityConciergeGroupData.Group, identityv1alpha1.AddToScheme, identityapi.AddToScheme)
 
 	// manually register conversions and defaulting into the correct scheme since we cannot directly call AddToScheme
 	schemeBuilder := runtime.NewSchemeBuilder(
@@ -299,9 +291,7 @@ func getAggregatedAPIServerScheme(apiGroupSuffix string) (_ *runtime.Scheme, log
 		credentialRequest.Spec.Authenticator.APIGroup = &restoredGroup
 	})
 
-	return scheme,
-		schema.GroupVersion{Group: loginConciergeAPIGroup, Version: loginv1alpha1.SchemeGroupVersion.Version},
-		schema.GroupVersion{Group: identityConciergeAPIGroup, Version: identityv1alpha1.SchemeGroupVersion.Version}
+	return scheme, schema.GroupVersion(loginConciergeGroupData), schema.GroupVersion(identityConciergeGroupData)
 }
 
 func addToSchemeAtNewGroup(scheme *runtime.Scheme, oldGroup, newGroup string, funcs ...func(*runtime.Scheme) error) {
