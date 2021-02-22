@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 
-	"go.pinniped.dev/internal/registry/whoamirequest"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,6 +17,7 @@ import (
 
 	"go.pinniped.dev/internal/plog"
 	"go.pinniped.dev/internal/registry/credentialrequest"
+	"go.pinniped.dev/internal/registry/whoamirequest"
 )
 
 type Config struct {
@@ -73,7 +73,7 @@ func (c completedConfig) New() (*PinnipedServer, error) {
 		GenericAPIServer: genericServer,
 	}
 
-	var errs []error
+	var errs []error //nolint: prealloc
 	for _, f := range []func() (schema.GroupVersionResource, rest.Storage){
 		func() (schema.GroupVersionResource, rest.Storage) {
 			tokenCredReqGVR := c.ExtraConfig.LoginConciergeGroupVersion.WithResource("tokencredentialrequests")
