@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"go.pinniped.dev/internal/controller/apicerts"
+
 	"github.com/sclevine/spec"
 	"github.com/sclevine/spec/report"
 	"github.com/stretchr/testify/assert"
@@ -38,6 +40,7 @@ import (
 	pinnipedfake "go.pinniped.dev/generated/latest/client/concierge/clientset/versioned/fake"
 	"go.pinniped.dev/internal/certauthority"
 	"go.pinniped.dev/internal/controllerlib"
+	"go.pinniped.dev/internal/dynamiccert"
 	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/testutil"
 )
@@ -71,6 +74,7 @@ func TestImpersonatorConfigControllerOptions(t *testing.T) {
 		const generatedLoadBalancerServiceName = "some-service-resource-name"
 		const tlsSecretName = "some-tls-secret-name" //nolint:gosec // this is not a credential
 		const caSecretName = "some-ca-secret-name"
+		const caSignerName = "some-ca-signer-name"
 
 		var r *require.Assertions
 		var observableWithInformerOption *testutil.ObservableWithInformerOption
@@ -105,6 +109,8 @@ func TestImpersonatorConfigControllerOptions(t *testing.T) {
 				nil,
 				nil,
 				nil,
+				nil,
+				caSignerName,
 				nil,
 			)
 			configMapsInformerFilter = observableWithInformerOption.GetFilterForInformer(configMapsInformer)
@@ -210,12 +216,13 @@ func TestImpersonatorConfigControllerOptions(t *testing.T) {
 
 		when("watching Secret objects", func() {
 			var subject controllerlib.Filter
-			var target1, target2, wrongNamespace1, wrongNamespace2, wrongName, unrelated *corev1.Secret
+			var target1, target2, target3, wrongNamespace1, wrongNamespace2, wrongName, unrelated *corev1.Secret
 
 			it.Before(func() {
 				subject = secretsInformerFilter
 				target1 = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsSecretName, Namespace: installedInNamespace}}
 				target2 = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: caSecretName, Namespace: installedInNamespace}}
+				target3 = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: caSignerName, Namespace: installedInNamespace}}
 				wrongNamespace1 = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tlsSecretName, Namespace: "wrong-namespace"}}
 				wrongNamespace2 = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: caSecretName, Namespace: "wrong-namespace"}}
 				wrongName = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "wrong-name", Namespace: installedInNamespace}}
@@ -232,6 +239,10 @@ func TestImpersonatorConfigControllerOptions(t *testing.T) {
 					r.True(subject.Update(target2, unrelated))
 					r.True(subject.Update(unrelated, target2))
 					r.True(subject.Delete(target2))
+					r.True(subject.Add(target3))
+					r.True(subject.Update(target3, unrelated))
+					r.True(subject.Update(unrelated, target3))
+					r.True(subject.Delete(target3))
 				})
 			})
 
@@ -285,6 +296,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		const loadBalancerServiceName = "some-service-resource-name"
 		const tlsSecretName = "some-tls-secret-name" //nolint:gosec // this is not a credential
 		const caSecretName = "some-ca-secret-name"
+		const caSignerName = "some-ca-signer-name"
 		const localhostIP = "127.0.0.1"
 		const httpsPort = ":443"
 		const fakeServerResponseBody = "hello, world!"
@@ -306,6 +318,9 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		var httpHandlerFactoryFuncError error
 		var startedTLSListener net.Listener
 		var frozenNow time.Time
+		var signingCertProvider dynamiccert.Provider
+		var signingCACertPEM, signingCAKeyPEM []byte
+		var signingCASecret *corev1.Secret
 
 		var startTLSListenerFunc = func(network, listenAddress string, config *tls.Config) (net.Listener, error) {
 			startTLSListenerFuncWasCalled++
@@ -454,6 +469,8 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						r.NoError(err)
 					}), httpHandlerFactoryFuncError
 				},
+				caSignerName,
+				signingCertProvider,
 			)
 
 			// Set this at the last second to support calling subject.Name().
@@ -534,6 +551,13 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		var newActualTLSSecretWithMultipleHostnames = func(ca *certauthority.CA, resourceName string, ip string) *corev1.Secret {
 			return newSecretWithData(resourceName, newTLSCertSecretData(ca, []string{"foo", "bar"}, ip))
+		}
+
+		var newSigningKeySecret = func(resourceName string, certPEM, keyPEM []byte) *corev1.Secret {
+			return newSecretWithData(resourceName, map[string][]byte{
+				apicerts.CACertificateSecretKey:           certPEM,
+				apicerts.CACertificatePrivateKeySecretKey: keyPEM,
+			})
 		}
 
 		var newLoadBalancerService = func(resourceName string, status corev1.ServiceStatus) *corev1.Service {
@@ -842,6 +866,19 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			validCert.RequireLifetime(time.Now().Add(-10*time.Second), time.Now().Add(100*time.Hour*24*365), 10*time.Second)
 		}
 
+		var requireSigningCertProviderHasLoadedCerts = func(certPEM, keyPEM []byte) {
+			actualCert, actualKey := signingCertProvider.CurrentCertKeyContent()
+			// Cast to string for better failure messages.
+			r.Equal(string(certPEM), string(actualCert))
+			r.Equal(string(keyPEM), string(actualKey))
+		}
+
+		var requireSigningCertProviderIsEmpty = func() {
+			actualCert, actualKey := signingCertProvider.CurrentCertKeyContent()
+			r.Nil(actualCert)
+			r.Nil(actualKey)
+		}
+
 		var runControllerSync = func() error {
 			return controllerlib.TestSync(t, subject, *syncContext)
 		}
@@ -856,6 +893,14 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			kubeAPIClient = kubernetesfake.NewSimpleClientset()
 			pinnipedAPIClient = pinnipedfake.NewSimpleClientset()
 			frozenNow = time.Date(2021, time.March, 2, 7, 42, 0, 0, time.Local)
+			signingCertProvider = dynamiccert.New()
+
+			ca := newCA()
+			signingCACertPEM = ca.Bundle()
+			var err error
+			signingCAKeyPEM, err = ca.PrivateKeyToPEM()
+			r.NoError(err)
+			signingCASecret = newSigningKeySecret(caSignerName, signingCACertPEM, signingCAKeyPEM)
 		})
 
 		it.After(func() {
@@ -865,6 +910,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		when("the ConfigMap does not yet exist in the installation namespace or it was deleted (defaults to auto mode)", func() {
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				addImpersonatorConfigMapToTracker("some-other-unrelated-configmap", "foo: bar", kubeInformerClient)
 			})
 
@@ -880,6 +926,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 1)
 					requireNodesListed(kubeAPIClient.Actions()[0])
 					requireCredentialIssuer(newAutoDisabledStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -900,6 +947,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireLoadBalancerWasDeleted(kubeAPIClient.Actions()[1])
 					requireTLSSecretWasDeleted(kubeAPIClient.Actions()[2])
 					requireCredentialIssuer(newAutoDisabledStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -917,6 +965,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
 					requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -935,6 +984,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireNodesListed(kubeAPIClient.Actions()[0])
 					requireCASecretWasCreated(kubeAPIClient.Actions()[1])
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -953,6 +1003,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireNodesListed(kubeAPIClient.Actions()[0])
 					requireCASecretWasCreated(kubeAPIClient.Actions()[1])
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -970,6 +1021,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 1)
 					requireNodesListed(kubeAPIClient.Actions()[0])
 					requireCredentialIssuer(newErrorStrategy("could not find valid IP addresses or hostnames from load balancer some-namespace/some-service-resource-name"))
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -990,6 +1042,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
 					requireTLSServerIsRunning(ca, fakeIP, map[string]string{fakeIP + ":443": testServerAddr()})
 					requireCredentialIssuer(newSuccessStrategy(fakeIP, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -999,6 +1052,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.NoError(runControllerSync())
 					r.Len(kubeAPIClient.Actions(), 3) // nothing changed
 					requireCredentialIssuer(newSuccessStrategy(fakeIP, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 				})
 			})
 
@@ -1019,6 +1073,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
 					requireTLSServerIsRunning(ca, firstHostname, map[string]string{firstHostname + httpsPort: testServerAddr()})
 					requireCredentialIssuer(newSuccessStrategy(firstHostname, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -1028,6 +1083,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.NoError(runControllerSync())
 					r.Len(kubeAPIClient.Actions(), 3) // nothing changed
 					requireCredentialIssuer(newSuccessStrategy(firstHostname, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 				})
 			})
 
@@ -1048,6 +1104,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
 					requireTLSServerIsRunning(ca, firstHostname, map[string]string{firstHostname + httpsPort: testServerAddr()})
 					requireCredentialIssuer(newSuccessStrategy(firstHostname, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -1057,6 +1114,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.NoError(runControllerSync())
 					r.Len(kubeAPIClient.Actions(), 3) // nothing changed
 					requireCredentialIssuer(newSuccessStrategy(firstHostname, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 				})
 			})
 
@@ -1082,6 +1140,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], caCrt)
 					requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
 					requireCredentialIssuer(newSuccessStrategy(localhostIP, caCrt))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 				})
 			})
 
@@ -1106,6 +1165,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasDeleted(kubeAPIClient.Actions()[1])
 					requireTLSServerIsRunningWithoutCerts()
 					requireCredentialIssuer(newErrorStrategy("error on delete"))
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -1137,11 +1197,16 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 1) // no new actions
 					requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
 					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 		})
 
 		when("the ConfigMap is already in the installation namespace", func() {
+			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
+			})
+
 			when("the configuration is auto mode with an endpoint", func() {
 				it.Before(func() {
 					configMapYAML := fmt.Sprintf("{mode: auto, endpoint: %s}", localhostIP)
@@ -1160,6 +1225,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireNodesListed(kubeAPIClient.Actions()[0])
 						r.Len(kubeAPIClient.Actions(), 1)
 						requireCredentialIssuer(newAutoDisabledStrategy())
+						requireSigningCertProviderIsEmpty()
 					})
 				})
 
@@ -1177,6 +1243,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
 						requireTLSServerIsRunning(ca, testServerAddr(), nil)
 						requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 			})
@@ -1194,6 +1261,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireNodesListed(kubeAPIClient.Actions()[0])
 					r.Len(kubeAPIClient.Actions(), 1)
 					requireCredentialIssuer(newManuallyDisabledStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 			})
 
@@ -1213,6 +1281,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 						requireTLSServerIsRunningWithoutCerts()
 						requireCredentialIssuer(newPendingStrategy())
+						requireSigningCertProviderIsEmpty()
 					})
 
 					it("returns an error when the tls listener fails to start", func() {
@@ -1220,6 +1289,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						startInformersAndController()
 						r.EqualError(runControllerSync(), "tls error")
 						requireCredentialIssuer(newErrorStrategy("tls error"))
+						requireSigningCertProviderIsEmpty()
 					})
 				})
 
@@ -1239,6 +1309,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireCASecretWasCreated(kubeAPIClient.Actions()[1])
 						requireTLSServerIsRunningWithoutCerts()
 						requireCredentialIssuer(newPendingStrategy())
+						requireSigningCertProviderIsEmpty()
 					})
 
 					it("returns an error when the tls listener fails to start", func() {
@@ -1246,6 +1317,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						startInformersAndController()
 						r.EqualError(runControllerSync(), "tls error")
 						requireCredentialIssuer(newErrorStrategy("tls error"))
+						requireSigningCertProviderIsEmpty()
 					})
 				})
 
@@ -1271,6 +1343,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireNodesListed(kubeAPIClient.Actions()[0])
 						requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
 						requireCredentialIssuer(newSuccessStrategy(localhostIP, caCrt))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1292,6 +1365,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1313,6 +1387,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeIPWithPort.
 						requireTLSServerIsRunning(ca, fakeIPWithPort, map[string]string{fakeIPWithPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeIPWithPort, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1334,6 +1409,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostnameWithPort.
 						requireTLSServerIsRunning(ca, fakeHostnameWithPort, map[string]string{fakeHostnameWithPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostnameWithPort, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1357,6 +1433,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeIP.
 						requireTLSServerIsRunning(ca, fakeIP, map[string]string{fakeIP + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeIP, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 						// Simulate the informer cache's background update from its watch.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -1372,9 +1449,11 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 						// Simulate the informer cache's background update from its watch.
 						deleteSecretFromTracker(tlsSecretName, kubeInformerClient)
+						waitForObjectToBeDeletedFromInformer(tlsSecretName, kubeInformers.Core().V1().Secrets())
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[4], kubeInformers.Core().V1().Secrets())
 
 						// Switch the endpoint config back to an IP.
@@ -1387,6 +1466,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeIP.
 						requireTLSServerIsRunning(ca, fakeIP, map[string]string{fakeIP + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeIP, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1408,6 +1488,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 						// Simulate the informer cache's background update from its watch for the CA Secret.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -1423,6 +1504,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1444,6 +1526,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 						// Simulate the informer cache's background update from its watch for the CA Secret.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
@@ -1461,6 +1544,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 				})
 
@@ -1480,6 +1564,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 						// Simulate the informer cache's background update from its watch for the CA Secret.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
@@ -1505,6 +1590,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
 						requireTLSServerIsRunning(caCrt, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, caCrt))
+						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 					})
 
 					when("deleting the TLS cert due to mismatched CA results in an error", func() {
@@ -1522,6 +1608,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 							r.Len(kubeAPIClient.Actions(), 4)
 							requireTLSSecretWasDeleted(kubeAPIClient.Actions()[3]) // tried to delete cert but failed
 							requireCredentialIssuer(newErrorStrategy("error on tls secret delete"))
+							requireSigningCertProviderIsEmpty()
 						})
 					})
 				})
@@ -1543,6 +1630,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
 					requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
@@ -1556,6 +1644,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 4)
 					requireLoadBalancerWasDeleted(kubeAPIClient.Actions()[3])
 					requireCredentialIssuer(newManuallyDisabledStrategy())
+					requireSigningCertProviderIsEmpty()
 
 					deleteServiceFromTracker(loadBalancerServiceName, kubeInformerClient)
 					waitForObjectToBeDeletedFromInformer(loadBalancerServiceName, kubeInformers.Core().V1().Services())
@@ -1568,6 +1657,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 5)
 					requireLoadBalancerWasCreated(kubeAPIClient.Actions()[4])
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 				})
 
 				when("there is an error while shutting down the server", func() {
@@ -1586,6 +1676,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						r.EqualError(runControllerSync(), "fake server close error")
 						requireTLSServerIsNoLongerRunning()
 						requireCredentialIssuer(newErrorStrategy("fake server close error"))
+						requireSigningCertProviderIsEmpty()
 					})
 				})
 			})
@@ -1608,6 +1699,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
 					requireTLSServerIsRunning(ca, testServerAddr(), nil)
 					requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
@@ -1622,6 +1714,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasDeleted(kubeAPIClient.Actions()[4]) // the Secret was deleted because it contained a cert with the wrong IP
 					requireTLSServerIsRunningWithoutCerts()
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[3], kubeInformers.Core().V1().Services())
@@ -1633,6 +1726,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					r.Len(kubeAPIClient.Actions(), 5) // no new actions while it is waiting for the load balancer's ingress
 					requireTLSServerIsRunningWithoutCerts()
 					requireCredentialIssuer(newPendingStrategy())
+					requireSigningCertProviderIsEmpty()
 
 					// Update the ingress of the LB in the informer's client and run Sync again.
 					fakeIP := "127.0.0.123"
@@ -1643,6 +1737,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					// Check that the server is running and that TLS certs that are being served are are for fakeIP.
 					requireTLSServerIsRunning(ca, fakeIP, map[string]string{fakeIP + httpsPort: testServerAddr()})
 					requireCredentialIssuer(newSuccessStrategy(fakeIP, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 					// Simulate the informer cache's background update from its watch.
 					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[5], kubeInformers.Core().V1().Secrets())
@@ -1658,12 +1753,14 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireTLSSecretWasCreated(kubeAPIClient.Actions()[8], ca) // recreated because the endpoint was updated, reused the old CA
 					requireTLSServerIsRunning(ca, testServerAddr(), nil)
 					requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 				})
 			})
 		})
 
 		when("sync is called more than once", func() {
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
 			})
 
@@ -1676,6 +1773,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 				requireTLSServerIsRunningWithoutCerts()
 				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
 
 				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
@@ -1685,6 +1783,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				r.Equal(1, startTLSListenerFuncWasCalled) // wasn't started a second time
 				requireTLSServerIsRunningWithoutCerts()   // still running
 				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
 				r.Len(kubeAPIClient.Actions(), 3) // no new API calls
 			})
 
@@ -1697,6 +1796,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				ca := requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 				requireTLSServerIsRunningWithoutCerts()
 				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
 
 				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
@@ -1710,6 +1810,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[3], ca) // uses the ca from last time
 				requireTLSServerIsRunning(ca, testServerAddr(), nil)       // running with certs now
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[3], kubeInformers.Core().V1().Secrets())
@@ -1719,6 +1820,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				r.Len(kubeAPIClient.Actions(), 4)                    // no more actions
 				requireTLSServerIsRunning(ca, testServerAddr(), nil) // still running
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 			})
 
 			it("creates certs from the hostname listed on the load balancer", func() {
@@ -1731,6 +1833,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				ca := requireCASecretWasCreated(kubeAPIClient.Actions()[2])
 				requireTLSServerIsRunningWithoutCerts()
 				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
 
 				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
@@ -1744,6 +1847,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[3], ca)                                         // uses the ca from last time
 				requireTLSServerIsRunning(ca, hostname, map[string]string{hostname + httpsPort: testServerAddr()}) // running with certs now
 				requireCredentialIssuer(newSuccessStrategy(hostname, ca))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
 				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[3], kubeInformers.Core().V1().Secrets())
@@ -1753,6 +1857,41 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				r.Len(kubeAPIClient.Actions(), 4)                                                                  // no more actions
 				requireTLSServerIsRunning(ca, hostname, map[string]string{hostname + httpsPort: testServerAddr()}) // still running
 				requireCredentialIssuer(newSuccessStrategy(hostname, ca))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
+			})
+		})
+
+		when("there is already a CredentialIssuer", func() {
+			preExistingStrategy := v1alpha1.CredentialIssuerStrategy{
+				Type:           v1alpha1.KubeClusterSigningCertificateStrategyType,
+				Status:         v1alpha1.SuccessStrategyStatus,
+				Reason:         v1alpha1.FetchedKeyStrategyReason,
+				Message:        "happy other unrelated strategy",
+				LastUpdateTime: metav1.NewTime(frozenNow),
+				Frontend: &v1alpha1.CredentialIssuerFrontend{
+					Type: v1alpha1.TokenCredentialRequestAPIFrontendType,
+				},
+			}
+
+			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
+				r.NoError(pinnipedAPIClient.Tracker().Add(&v1alpha1.CredentialIssuer{
+					ObjectMeta: metav1.ObjectMeta{Name: credentialIssuerResourceName},
+					Status:     v1alpha1.CredentialIssuerStatus{Strategies: []v1alpha1.CredentialIssuerStrategy{preExistingStrategy}},
+				}))
+				addNodeWithRoleToTracker("worker", kubeAPIClient)
+			})
+
+			it("merges into the existing strategy array on the CredentialIssuer", func() {
+				startInformersAndController()
+				r.NoError(runControllerSync())
+				requireTLSServerIsRunningWithoutCerts()
+				r.Len(kubeAPIClient.Actions(), 3)
+				requireNodesListed(kubeAPIClient.Actions()[0])
+				requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
+				requireCASecretWasCreated(kubeAPIClient.Actions()[2])
+				credentialIssuer := getCredentialIssuer()
+				r.Equal([]v1alpha1.CredentialIssuerStrategy{preExistingStrategy, newPendingStrategy()}, credentialIssuer.Status.Strategies)
 			})
 		})
 
@@ -1761,6 +1900,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				startInformersAndController()
 				r.EqualError(runControllerSync(), "no nodes found")
 				requireCredentialIssuer(newErrorStrategy("no nodes found"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerWasNeverStarted()
 			})
 		})
@@ -1775,6 +1915,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				startInformersAndController()
 				r.EqualError(runControllerSync(), "some factory error")
 				requireCredentialIssuer(newErrorStrategy("some factory error"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerWasNeverStarted()
 			})
 		})
@@ -1789,6 +1930,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				errString := "invalid impersonator configuration: decode yaml: error unmarshaling JSON: while decoding JSON: json: cannot unmarshal string into Go value of type impersonator.Config"
 				r.EqualError(runControllerSync(), errString)
 				requireCredentialIssuer(newErrorStrategy(errString))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerWasNeverStarted()
 			})
 		})
@@ -1805,6 +1947,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				startInformersAndController()
 				r.EqualError(runControllerSync(), "error on create")
 				requireCredentialIssuer(newErrorStrategy("error on create"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerIsRunningWithoutCerts()
 			})
 		})
@@ -1826,6 +1969,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				startInformersAndController()
 				r.EqualError(runControllerSync(), "error on tls secret create")
 				requireCredentialIssuer(newErrorStrategy("error on tls secret create"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerIsRunningWithoutCerts()
 				r.Len(kubeAPIClient.Actions(), 3)
 				requireNodesListed(kubeAPIClient.Actions()[0])
@@ -1851,6 +1995,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				startInformersAndController()
 				r.EqualError(runControllerSync(), "error on ca secret create")
 				requireCredentialIssuer(newErrorStrategy("error on ca secret create"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerIsRunningWithoutCerts()
 				r.Len(kubeAPIClient.Actions(), 2)
 				requireNodesListed(kubeAPIClient.Actions()[0])
@@ -1870,6 +2015,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				errString := "could not load CA: tls: failed to find any PEM data in certificate input"
 				r.EqualError(runControllerSync(), errString)
 				requireCredentialIssuer(newErrorStrategy(errString))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerIsRunningWithoutCerts()
 				r.Len(kubeAPIClient.Actions(), 1)
 				requireNodesListed(kubeAPIClient.Actions()[0])
@@ -1891,6 +2037,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			it("does not start the impersonator, deletes the loadbalancer, returns an error", func() {
 				r.EqualError(runControllerSync(), "error on delete")
 				requireCredentialIssuer(newErrorStrategy("error on delete"))
+				requireSigningCertProviderIsEmpty()
 				requireTLSServerWasNeverStarted()
 				r.Len(kubeAPIClient.Actions(), 3)
 				requireNodesListed(kubeAPIClient.Actions()[0])
@@ -1901,6 +2048,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		when("the PEM formatted data in the TLS Secret is not a valid cert", func() {
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				configMapYAML := fmt.Sprintf("{mode: enabled, endpoint: %s}", localhostIP)
 				addImpersonatorConfigMapToTracker(configMapResourceName, configMapYAML, kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
@@ -1927,6 +2075,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[3], ca)
 				requireTLSServerIsRunning(ca, testServerAddr(), nil)
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 			})
 
 			when("there is an error while the invalid cert is being deleted", func() {
@@ -1941,6 +2090,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					errString := "PEM data represented an invalid cert, but got error while deleting it: error on delete"
 					r.EqualError(runControllerSync(), errString)
 					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
 					requireTLSServerIsRunningWithoutCerts()
 					r.Len(kubeAPIClient.Actions(), 3)
 					requireNodesListed(kubeAPIClient.Actions()[0])
@@ -1954,6 +2104,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		when("a tls secret already exists but it is not valid", func() {
 			var caCrt []byte
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				addImpersonatorConfigMapToTracker(configMapResourceName, "mode: enabled", kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
 				ca := newCA()
@@ -1974,6 +2125,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], caCrt)
 				requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, caCrt))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 			})
 
 			when("there is an error while the invalid cert is being deleted", func() {
@@ -1988,6 +2140,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					errString := "found missing or not PEM-encoded data in TLS Secret, but got error while deleting it: error on delete"
 					r.EqualError(runControllerSync(), errString)
 					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
 					requireTLSServerIsRunningWithoutCerts()
 					r.Len(kubeAPIClient.Actions(), 2)
 					requireNodesListed(kubeAPIClient.Actions()[0])
@@ -2000,6 +2153,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		when("a tls secret already exists but the private key is not valid", func() {
 			var caCrt []byte
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				addImpersonatorConfigMapToTracker(configMapResourceName, "mode: enabled", kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
 				ca := newCA()
@@ -2022,6 +2176,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], caCrt)
 				requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, caCrt))
+				requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 			})
 
 			when("there is an error while the invalid cert is being deleted", func() {
@@ -2036,6 +2191,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					errString := "cert had an invalid private key, but got error while deleting it: error on delete"
 					r.EqualError(runControllerSync(), errString)
 					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
 					requireTLSServerIsRunningWithoutCerts()
 					r.Len(kubeAPIClient.Actions(), 2)
 					requireNodesListed(kubeAPIClient.Actions()[0])
@@ -2047,6 +2203,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		when("there is an error while creating or updating the CredentialIssuer status", func() {
 			it.Before(func() {
+				addSecretToTrackers(signingCASecret, kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
 				pinnipedAPIClient.PrependReactor("create", "credentialissuers", func(action coretesting.Action) (handled bool, ret runtime.Object, err error) {
 					return true, nil, fmt.Errorf("error on create")
@@ -2072,36 +2229,87 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			})
 		})
 
-		when("there is already a CredentialIssuer", func() {
-			preExistingStrategy := v1alpha1.CredentialIssuerStrategy{
-				Type:           v1alpha1.KubeClusterSigningCertificateStrategyType,
-				Status:         v1alpha1.SuccessStrategyStatus,
-				Reason:         v1alpha1.FetchedKeyStrategyReason,
-				Message:        "happy other unrelated strategy",
-				LastUpdateTime: metav1.NewTime(frozenNow),
-				Frontend: &v1alpha1.CredentialIssuerFrontend{
-					Type: v1alpha1.TokenCredentialRequestAPIFrontendType,
-				},
-			}
-
+		when("the impersonator is ready but there is a problem with the signing secret, which should be created by another controller", func() {
+			const fakeHostname = "foo.example.com"
 			it.Before(func() {
-				r.NoError(pinnipedAPIClient.Tracker().Add(&v1alpha1.CredentialIssuer{
-					ObjectMeta: metav1.ObjectMeta{Name: credentialIssuerResourceName},
-					Status:     v1alpha1.CredentialIssuerStatus{Strategies: []v1alpha1.CredentialIssuerStrategy{preExistingStrategy}},
-				}))
+				configMapYAML := fmt.Sprintf("{mode: enabled, endpoint: %s}", fakeHostname)
+				addImpersonatorConfigMapToTracker(configMapResourceName, configMapYAML, kubeInformerClient)
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
 			})
 
-			it("merges into the existing strategy array on the CredentialIssuer", func() {
-				startInformersAndController()
-				r.NoError(runControllerSync())
-				requireTLSServerIsRunningWithoutCerts()
-				r.Len(kubeAPIClient.Actions(), 3)
-				requireNodesListed(kubeAPIClient.Actions()[0])
-				requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
-				requireCASecretWasCreated(kubeAPIClient.Actions()[2])
-				credentialIssuer := getCredentialIssuer()
-				r.Equal([]v1alpha1.CredentialIssuerStrategy{preExistingStrategy, newPendingStrategy()}, credentialIssuer.Status.Strategies)
+			when("it does not exist in the informers", func() {
+				it("returns the error", func() {
+					startInformersAndController()
+					errString := `could not load the impersonator's credential signing secret: secret "some-ca-signer-name" not found`
+					r.EqualError(runControllerSync(), errString)
+					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
+				})
+			})
+
+			when("it does not have the expected fields", func() {
+				it.Before(func() {
+					addSecretToTrackers(newEmptySecret(caSignerName), kubeInformerClient)
+				})
+
+				it("returns the error", func() {
+					startInformersAndController()
+					errString := `could not load the impersonator's credential signing secret: tls: failed to find any PEM data in certificate input`
+					r.EqualError(runControllerSync(), errString)
+					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
+				})
+			})
+
+			when("the cert is invalid", func() {
+				it.Before(func() {
+					signingCASecret.Data[apicerts.CACertificateSecretKey] = []byte("not a valid PEM formatted cert")
+					addSecretToTrackers(signingCASecret, kubeInformerClient)
+				})
+
+				it("returns the error", func() {
+					startInformersAndController()
+					errString := `could not load the impersonator's credential signing secret: tls: failed to find any PEM data in certificate input`
+					r.EqualError(runControllerSync(), errString)
+					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
+				})
+			})
+
+			when("the cert goes from being valid to being invalid", func() {
+				const fakeHostname = "foo.example.com"
+				it.Before(func() {
+					addSecretToTrackers(signingCASecret, kubeInformerClient)
+				})
+
+				it("returns the error and clears the dynamic provider", func() {
+					startInformersAndController()
+					r.NoError(runControllerSync())
+					r.Len(kubeAPIClient.Actions(), 3)
+					requireNodesListed(kubeAPIClient.Actions()[0])
+					ca := requireCASecretWasCreated(kubeAPIClient.Actions()[1])
+					requireTLSSecretWasCreated(kubeAPIClient.Actions()[2], ca)
+					// Check that the server is running and that TLS certs that are being served are are for fakeHostname.
+					requireTLSServerIsRunning(ca, fakeHostname, map[string]string{fakeHostname + httpsPort: testServerAddr()})
+					requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
+					requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
+
+					// Simulate the informer cache's background update from its watch.
+					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
+					addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
+
+					// Now update the signer CA to something invalid.
+					deleteSecretFromTracker(caSignerName, kubeInformerClient)
+					waitForObjectToBeDeletedFromInformer(caSignerName, kubeInformers.Core().V1().Secrets())
+					updatedSigner := newEmptySecret(caSignerName)
+					addSecretToTrackers(updatedSigner, kubeInformerClient)
+					waitForObjectToAppearInInformer(updatedSigner, kubeInformers.Core().V1().Secrets())
+
+					errString := `could not load the impersonator's credential signing secret: tls: failed to find any PEM data in certificate input`
+					r.EqualError(runControllerSync(), errString)
+					requireCredentialIssuer(newErrorStrategy(errString))
+					requireSigningCertProviderIsEmpty()
+				})
 			})
 		})
 	}, spec.Parallel(), spec.Report(report.Terminal{}))

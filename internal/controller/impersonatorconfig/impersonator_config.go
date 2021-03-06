@@ -18,11 +18,14 @@ import (
 	"sync"
 	"time"
 
+	"go.pinniped.dev/internal/controller/apicerts"
+
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/clock"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -34,6 +37,7 @@ import (
 	pinnipedcontroller "go.pinniped.dev/internal/controller"
 	"go.pinniped.dev/internal/controller/issuerconfig"
 	"go.pinniped.dev/internal/controllerlib"
+	"go.pinniped.dev/internal/dynamiccert"
 	"go.pinniped.dev/internal/plog"
 )
 
@@ -54,6 +58,7 @@ type impersonatorConfigController struct {
 	generatedLoadBalancerServiceName string
 	tlsSecretName                    string
 	caSecretName                     string
+	impersonationSignerSecretName    string
 
 	k8sClient         kubernetes.Interface
 	pinnipedAPIClient pinnipedclientset.Interface
@@ -62,10 +67,11 @@ type impersonatorConfigController struct {
 	servicesInformer   corev1informers.ServiceInformer
 	secretsInformer    corev1informers.SecretInformer
 
-	labels               map[string]string
-	clock                clock.Clock
-	startTLSListenerFunc StartTLSListenerFunc
-	httpHandlerFactory   func() (http.Handler, error)
+	labels                           map[string]string
+	clock                            clock.Clock
+	startTLSListenerFunc             StartTLSListenerFunc
+	httpHandlerFactory               func() (http.Handler, error)
+	impersonationSigningCertProvider dynamiccert.Provider
 
 	server               *http.Server
 	hasControlPlaneNodes *bool
@@ -93,7 +99,10 @@ func NewImpersonatorConfigController(
 	clock clock.Clock,
 	startTLSListenerFunc StartTLSListenerFunc,
 	httpHandlerFactory func() (http.Handler, error),
+	impersonationSignerSecretName string,
+	impersonationSigningCertProvider dynamiccert.Provider,
 ) controllerlib.Controller {
+	secretNames := sets.NewString(tlsSecretName, caSecretName, impersonationSignerSecretName)
 	return controllerlib.New(
 		controllerlib.Config{
 			Name: "impersonator-config-controller",
@@ -104,6 +113,7 @@ func NewImpersonatorConfigController(
 				generatedLoadBalancerServiceName: generatedLoadBalancerServiceName,
 				tlsSecretName:                    tlsSecretName,
 				caSecretName:                     caSecretName,
+				impersonationSignerSecretName:    impersonationSignerSecretName,
 				k8sClient:                        k8sClient,
 				pinnipedAPIClient:                pinnipedAPIClient,
 				configMapsInformer:               configMapsInformer,
@@ -113,6 +123,7 @@ func NewImpersonatorConfigController(
 				clock:                            clock,
 				startTLSListenerFunc:             startTLSListenerFunc,
 				httpHandlerFactory:               httpHandlerFactory,
+				impersonationSigningCertProvider: impersonationSigningCertProvider,
 			},
 		},
 		withInformer(
@@ -128,7 +139,7 @@ func NewImpersonatorConfigController(
 		withInformer(
 			secretsInformer,
 			pinnipedcontroller.SimpleFilter(func(obj metav1.Object) bool {
-				return (obj.GetName() == tlsSecretName || obj.GetName() == caSecretName) && obj.GetNamespace() == namespace
+				return obj.GetNamespace() == namespace && secretNames.Has(obj.GetName())
 			}, nil),
 			controllerlib.InformerOption{},
 		),
@@ -154,6 +165,8 @@ func (c *impersonatorConfigController) Sync(syncCtx controllerlib.Context) error
 			Message:        err.Error(),
 			LastUpdateTime: metav1.NewTime(c.clock.Now()),
 		}
+		// The impersonator is not ready, so clear the signer CA from the dynamic provider.
+		c.clearSignerCA()
 	}
 
 	updateStrategyErr := c.updateStrategy(syncCtx.Context, strategy)
@@ -242,7 +255,13 @@ func (c *impersonatorConfigController) doSync(ctx context.Context) (*v1alpha1.Cr
 		return nil, err
 	}
 
-	return c.doSyncResult(nameInfo, config, impersonationCA), nil
+	credentialIssuerStrategyResult := c.doSyncResult(nameInfo, config, impersonationCA)
+
+	if err = c.loadSignerCA(credentialIssuerStrategyResult.Status); err != nil {
+		return nil, err
+	}
+
+	return credentialIssuerStrategyResult, nil
 }
 
 func (c *impersonatorConfigController) loadImpersonationProxyConfiguration() (*impersonator.Config, error) {
@@ -739,6 +758,38 @@ func (c *impersonatorConfigController) ensureTLSSecretIsRemoved(ctx context.Cont
 	c.setTLSCert(nil)
 
 	return nil
+}
+
+func (c *impersonatorConfigController) loadSignerCA(status v1alpha1.StrategyStatus) error {
+	// Clear it when the impersonator is not completely ready.
+	if status != v1alpha1.SuccessStrategyStatus {
+		c.clearSignerCA()
+		return nil
+	}
+
+	signingCertSecret, err := c.secretsInformer.Lister().Secrets(c.namespace).Get(c.impersonationSignerSecretName)
+	if err != nil {
+		return fmt.Errorf("could not load the impersonator's credential signing secret: %w", err)
+	}
+
+	certPEM := signingCertSecret.Data[apicerts.CACertificateSecretKey]
+	keyPEM := signingCertSecret.Data[apicerts.CACertificatePrivateKeySecretKey]
+	_, err = tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return fmt.Errorf("could not load the impersonator's credential signing secret: %w", err)
+	}
+
+	plog.Info("Loading credential signing certificate for impersonation proxy",
+		"certPEM", string(certPEM),
+		"fromSecret", c.impersonationSignerSecretName,
+		"namespace", c.namespace)
+	c.impersonationSigningCertProvider.Set(certPEM, keyPEM)
+	return nil
+}
+
+func (c *impersonatorConfigController) clearSignerCA() {
+	plog.Info("Clearing credential signing certificate for impersonation proxy")
+	c.impersonationSigningCertProvider.Set(nil, nil)
 }
 
 func (c *impersonatorConfigController) doSyncResult(nameInfo *certNameInfo, config *impersonator.Config, ca *certauthority.CA) *v1alpha1.CredentialIssuerStrategy {

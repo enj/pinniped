@@ -67,9 +67,11 @@ type Config struct {
 
 	// DynamicServingCertProvider provides a setter and a getter to the Pinniped API's serving cert.
 	DynamicServingCertProvider dynamiccert.Provider
-	// DynamicSigningCertProvider provides a setter and a getter to the Pinniped API's
+	// DynamicSigningCertProvider provides a setter and a getter to the Pinniped API's  // TODO fix comment
 	// signing cert, i.e., the cert that it uses to sign certs for Pinniped clients wishing to login.
 	DynamicSigningCertProvider dynamiccert.Provider
+	// TODO fix comment
+	ImpersonationSigningCertProvider dynamiccert.Provider
 
 	// ServingCertDuration is the validity period, in seconds, of the API serving certificate.
 	ServingCertDuration time.Duration
@@ -188,6 +190,7 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 				informers.installationNamespaceK8s.Core().V1().Secrets(),
 				controllerlib.WithInformer,
 				c.ServingCertRenewBefore,
+				apicerts.TLSCertificateChainSecretKey,
 			),
 			singletonWorker,
 		).
@@ -307,6 +310,35 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 					}
 					return impersonationProxyHandler, nil
 				},
+				c.NamesConfig.ImpersonationSignerSecret,
+				c.ImpersonationSigningCertProvider,
+			),
+			singletonWorker,
+		).
+		WithController(
+			apicerts.NewCertsManagerController(
+				c.ServerInstallationInfo.Namespace,
+				c.NamesConfig.ImpersonationSignerSecret,
+				c.Labels,
+				client.Kubernetes,
+				informers.installationNamespaceK8s.Core().V1().Secrets(),
+				controllerlib.WithInformer,
+				controllerlib.WithInitialEvent,
+				365*24*time.Hour, // 1 year hard coded value
+				"Pinniped Impersonation Proxy CA",
+				"", // optional, means do not give me a serving cert
+			),
+			singletonWorker,
+		).
+		WithController(
+			apicerts.NewCertsExpirerController(
+				c.ServerInstallationInfo.Namespace,
+				c.NamesConfig.ImpersonationSignerSecret,
+				client.Kubernetes,
+				informers.installationNamespaceK8s.Core().V1().Secrets(),
+				controllerlib.WithInformer,
+				c.ServingCertRenewBefore,
+				apicerts.CACertificateSecretKey,
 			),
 			singletonWorker,
 		)
