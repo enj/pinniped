@@ -5,60 +5,119 @@ package impersonator
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/go-logr/logr"
+	"go.pinniped.dev/internal/plog"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 
-	"go.pinniped.dev/generated/latest/apis/concierge/login"
-	"go.pinniped.dev/internal/constable"
-	"go.pinniped.dev/internal/controller/authenticator/authncache"
+	"go.pinniped.dev/internal/httputil/securityheader"
 	"go.pinniped.dev/internal/kubeclient"
 )
 
-var impersonateHeaderRegex = regexp.MustCompile("Impersonate-.*")
+func New(
+	port int,
+	dynamicCertProvider dynamiccertificates.CertKeyContentProvider,
+	impersonationProxySignerCA dynamiccertificates.CAContentProvider,
+) (func(stopCh <-chan struct{}) error, error) {
+	// bare minimum server side scheme
+	scheme := runtime.NewScheme()
+	metav1.AddToGroupVersion(scheme, metav1.Unversioned)
+	codecs := serializer.NewCodecFactory(scheme)
 
-type proxy struct {
-	cache       *authncache.Cache
-	jsonDecoder runtime.Decoder
-	proxy       *httputil.ReverseProxy
-	log         logr.Logger
-}
+	// this is unused for now but it is a safe value that we could use in the future
+	defaultEtcdPathPrefix := "/pinniped-impersonation-proxy-registry"
 
-func New(cache *authncache.Cache, jsonDecoder runtime.Decoder, log logr.Logger) (http.Handler, error) {
-	return newInternal(cache, jsonDecoder, log, func() (*rest.Config, error) {
-		client, err := kubeclient.New()
-		if err != nil {
-			return nil, err
-		}
-		return client.JSONConfig, nil
-	})
-}
+	recommendedOptions := genericoptions.NewRecommendedOptions(
+		defaultEtcdPathPrefix,
+		codecs.LegacyCodec(),
+	)
+	recommendedOptions.Etcd = nil // turn off etcd storage because we don't need it yet
+	recommendedOptions.SecureServing.ServerCert.GeneratedCert = dynamicCertProvider
+	recommendedOptions.SecureServing.BindPort = port
 
-func newInternal(cache *authncache.Cache, jsonDecoder runtime.Decoder, log logr.Logger, getConfig func() (*rest.Config, error)) (*proxy, error) {
-	kubeconfig, err := getConfig()
+	// wire up the impersonation proxy signer CA as a valid authenticator
+	// TODO fix comments
+	kubeClient, err := kubeclient.New()
 	if err != nil {
-		return nil, fmt.Errorf("could not get in-cluster config: %w", err)
+		return nil, err
 	}
 
-	serverURL, err := url.Parse(kubeconfig.Host)
+	kubeClientCA, err := dynamiccertificates.NewDynamicCAFromConfigMapController("client-ca", metav1.NamespaceSystem, "extension-apiserver-authentication", "client-ca-file", kubeClient.Kubernetes)
+	if err != nil {
+		return nil, err
+	}
+	recommendedOptions.Authentication.ClientCert.ClientCA = "---irrelevant-but-needs-to-be-non-empty---"
+	recommendedOptions.Authentication.ClientCert.CAContentProvider = dynamiccertificates.NewUnionCAContentProvider(impersonationProxySignerCA, kubeClientCA)
+
+	serverConfig := genericapiserver.NewRecommendedConfig(codecs)
+	if err := recommendedOptions.ApplyTo(serverConfig); err != nil {
+		return nil, err
+	}
+
+	impersonationProxy, err := newImpersonationReverseProxy(rest.CopyConfig(kubeClient.JSONConfig))
+	if err != nil {
+		return nil, err
+	}
+
+	defaultBuildHandlerChainFunc := serverConfig.BuildHandlerChainFunc
+	serverConfig.BuildHandlerChainFunc = func(_ http.Handler, c *genericapiserver.Config) http.Handler {
+		// we ignore the passed in handler because we never have any REST APIs to delegate to
+		handler := defaultBuildHandlerChainFunc(impersonationProxy, c)
+		handler = securityheader.Wrap(handler)
+		return handler
+	}
+
+	// TODO integration test this authorizer logic with system:masters + double impersonation
+	// empty string is disallowed because request info has had bugs in the past where it would leave it empty
+	disallowedVerbs := sets.NewString("", "impersonate")
+	noImpersonationAuthorizer := authorizer.AuthorizerFunc(func(a authorizer.Attributes) (authorizer.Decision, string, error) {
+		// supporting impersonation is not hard, it would just require a bunch of testing
+		// and configuring the audit layer (to preserve the caller) which we can do later
+		// we would also want to delete the incoming impersonation headers
+		if disallowedVerbs.Has(a.GetVerb()) {
+			return authorizer.DecisionDeny, "impersonation is not allowed or invalid verb", nil
+		}
+
+		return authorizer.DecisionAllow, "defering authorization to kube API server", nil
+	})
+	// TODO write a big comment explaining wth this is doing
+	serverConfig.Authorization.Authorizer = noImpersonationAuthorizer
+	completedConfig := serverConfig.Complete()
+	completedConfig.Authorization.Authorizer = noImpersonationAuthorizer
+
+	impersonationProxyServer, err := completedConfig.New("impersonation-proxy", genericapiserver.NewEmptyDelegate())
+	if err != nil {
+		return nil, err
+	}
+
+	runFunc := impersonationProxyServer.PrepareRun().Run
+
+	return runFunc, nil
+}
+
+func newImpersonationReverseProxy(restConfig *rest.Config) (http.Handler, error) {
+	serverURL, err := url.Parse(restConfig.Host)
 	if err != nil {
 		return nil, fmt.Errorf("could not parse host URL from in-cluster config: %w", err)
 	}
 
-	kubeTransportConfig, err := kubeconfig.TransportConfig()
+	kubeTransportConfig, err := restConfig.TransportConfig()
 	if err != nil {
 		return nil, fmt.Errorf("could not get in-cluster transport config: %w", err)
 	}
@@ -73,89 +132,56 @@ func newInternal(cache *authncache.Cache, jsonDecoder runtime.Decoder, log logr.
 	reverseProxy.Transport = kubeRoundTripper
 	reverseProxy.FlushInterval = 200 * time.Millisecond // the "watch" verb will not work without this line
 
-	return &proxy{
-		cache:       cache,
-		jsonDecoder: jsonDecoder,
-		proxy:       reverseProxy,
-		log:         log,
-	}, nil
-}
-
-func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log := p.log.WithValues(
-		"url", r.URL.String(),
-		"method", r.Method,
-	)
-
-	if err := ensureNoImpersonationHeaders(r); err != nil {
-		log.Error(err, "impersonation header already exists")
-		http.Error(w, "impersonation header already exists", http.StatusBadRequest)
-		return
-	}
-
-	// Never mutate request (see http.Handler docs).
-	newR := r.Clone(r.Context())
-
-	authentication, authenticated, err := bearertoken.New(authenticator.TokenFunc(func(ctx context.Context, token string) (*authenticator.Response, bool, error) {
-		tokenCredentialReq, err := extractToken(token, p.jsonDecoder)
-		if err != nil {
-			log.Error(err, "invalid token encoding")
-			return nil, false, &httpError{message: "invalid token encoding", code: http.StatusBadRequest}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO integration test using a bearer token
+		if len(r.Header.Values("Authorization")) != 0 {
+			plog.Warning("aggregated API server logic did not delete authorization header but it is always supposed to do so",
+				"url", r.URL.String(),
+				"method", r.Method,
+			)
+			http.Error(w, "invalid authorization header", http.StatusInternalServerError)
+			return
 		}
 
-		log = log.WithValues(
-			"authenticator", tokenCredentialReq.Spec.Authenticator,
-		)
-
-		userInfo, err := p.cache.AuthenticateTokenCredentialRequest(newR.Context(), tokenCredentialReq)
-		if err != nil {
-			log.Error(err, "received invalid token")
-			return nil, false, &httpError{message: "invalid token", code: http.StatusUnauthorized}
+		if err := ensureNoImpersonationHeaders(r); err != nil {
+			plog.Error("noImpersonationAuthorizer logic did not prevent nested impersonation but it is always supposed to do so",
+				err,
+				"url", r.URL.String(),
+				"method", r.Method,
+			)
+			http.Error(w, "invalid impersonation", http.StatusInternalServerError)
+			return
 		}
-		if userInfo == nil {
-			log.Info("received token that did not authenticate")
-			return nil, false, &httpError{message: "not authenticated", code: http.StatusUnauthorized}
-		}
-		log = log.WithValues("userID", userInfo.GetUID())
 
-		return &authenticator.Response{User: userInfo}, true, nil
-	})).AuthenticateRequest(newR)
-	if err != nil {
-		httpErr, ok := err.(*httpError)
+		userInfo, ok := request.UserFrom(r.Context())
 		if !ok {
-			log.Error(err, "unrecognized error")
-			http.Error(w, "unrecognized error", http.StatusInternalServerError)
+			plog.Warning("aggregated API server logic did not set user info but it is always supposed to do so",
+				"url", r.URL.String(),
+				"method", r.Method,
+			)
+			http.Error(w, "invalid user", http.StatusInternalServerError)
+			return
 		}
-		http.Error(w, httpErr.message, httpErr.code)
-		return
-	}
-	if !authenticated {
-		log.Error(constable.Error("token authenticator did not find token"), "invalid token encoding")
-		http.Error(w, "invalid token encoding", http.StatusBadRequest)
-		return
-	}
 
-	newR.Header = getProxyHeaders(authentication.User, r.Header)
-
-	log.Info("proxying authenticated request")
-	p.proxy.ServeHTTP(w, newR)
-}
-
-type httpError struct {
-	message string
-	code    int
-}
-
-func (e *httpError) Error() string { return e.message }
-
-func ensureNoImpersonationHeaders(r *http.Request) error {
-	for key := range r.Header {
-		if impersonateHeaderRegex.MatchString(key) {
-			return fmt.Errorf("%q header already exists", key)
+		if len(userInfo.GetUID()) > 0 {
+			plog.Warning("rejecting request with UID since we cannot impersonate UIDs",
+				"url", r.URL.String(),
+				"method", r.Method,
+			)
+			http.Error(w, "unexpected uid", http.StatusUnprocessableEntity)
+			return
 		}
-	}
 
-	return nil
+		// Never mutate request (see http.Handler docs).
+		newR := r.Clone(r.Context())
+		newR.Header = getProxyHeaders(userInfo, r.Header)
+
+		plog.Trace("proxying authenticated request",
+			"url", r.URL.String(),
+			"method", r.Method,
+		)
+		reverseProxy.ServeHTTP(w, newR)
+	}), nil
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -163,7 +189,7 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func getProxyHeaders(userInfo user.Info, requestHeaders http.Header) http.Header {
-	newHeaders := http.Header{}
+	newHeaders := requestHeaders.Clone()
 
 	// Leverage client-go's impersonation RoundTripper to set impersonation headers for us in the new
 	// request. The client-go RoundTripper not only sets all of the impersonation headers for us, but
@@ -193,33 +219,15 @@ func getProxyHeaders(userInfo user.Info, requestHeaders http.Header) http.Header
 	//nolint:bodyclose // We return a nil http.Response above, so there is nothing to close.
 	_, _ = transport.NewImpersonatingRoundTripper(impersonateConfig, impersonateHeaderSpy).RoundTrip(fakeReq)
 
-	// Copy over all headers except the Authorization header from the original request to the new request.
-	for key := range requestHeaders {
-		if key != "Authorization" {
-			for _, val := range requestHeaders.Values(key) {
-				newHeaders.Add(key, val)
-			}
-		}
-	}
-
 	return newHeaders
 }
 
-func extractToken(token string, jsonDecoder runtime.Decoder) (*login.TokenCredentialRequest, error) {
-	tokenCredentialRequestJSON, err := base64.StdEncoding.DecodeString(token)
-	if err != nil {
-		return nil, fmt.Errorf("invalid base64 in encoded bearer token: %w", err)
+func ensureNoImpersonationHeaders(r *http.Request) error {
+	for key := range r.Header {
+		if strings.HasPrefix(key, "Impersonate") {
+			return fmt.Errorf("%q header already exists", key)
+		}
 	}
 
-	obj, err := runtime.Decode(jsonDecoder, tokenCredentialRequestJSON)
-	if err != nil {
-		return nil, fmt.Errorf("invalid object encoded in bearer token: %w", err)
-	}
-
-	tokenCredentialRequest, ok := obj.(*login.TokenCredentialRequest)
-	if !ok {
-		return nil, fmt.Errorf("invalid TokenCredentialRequest encoded in bearer token: got %T", obj)
-	}
-
-	return tokenCredentialRequest, nil
+	return nil
 }

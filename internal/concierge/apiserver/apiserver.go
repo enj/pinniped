@@ -18,6 +18,7 @@ import (
 	"go.pinniped.dev/internal/plog"
 	"go.pinniped.dev/internal/registry/credentialrequest"
 	"go.pinniped.dev/internal/registry/whoamirequest"
+	"go.pinniped.dev/internal/issuer"
 )
 
 type Config struct {
@@ -27,7 +28,7 @@ type Config struct {
 
 type ExtraConfig struct {
 	Authenticator                 credentialrequest.TokenCredentialRequestAuthenticator
-	Issuer                        credentialrequest.CertIssuer
+	Issuer                        issuer.CertIssuer
 	StartControllersPostStartHook func(ctx context.Context)
 	Scheme                        *runtime.Scheme
 	NegotiatedSerializer          runtime.NegotiatedSerializer

@@ -17,7 +17,6 @@ import (
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	genericoptions "k8s.io/apiserver/pkg/server/options"
 
-	loginapi "go.pinniped.dev/generated/latest/apis/concierge/login"
 	"go.pinniped.dev/internal/certauthority/dynamiccertauthority"
 	"go.pinniped.dev/internal/concierge/apiserver"
 	conciergescheme "go.pinniped.dev/internal/concierge/scheme"
@@ -145,7 +144,6 @@ func (a *App) runServer(ctx context.Context) error {
 			ServingCertDuration:              time.Duration(*cfg.APIConfig.ServingCertificateConfig.DurationSeconds) * time.Second,
 			ServingCertRenewBefore:           time.Duration(*cfg.APIConfig.ServingCertificateConfig.RenewBeforeSeconds) * time.Second,
 			AuthenticatorCache:               authenticators,
-			LoginJSONDecoder:                 getLoginJSONDecoder(loginGV.Group, scheme),
 		},
 	)
 	if err != nil {
@@ -232,17 +230,4 @@ func getAggregatedAPIServerConfig(
 		},
 	}
 	return apiServerConfig, nil
-}
-
-func getLoginJSONDecoder(loginConciergeAPIGroup string, loginConciergeScheme *runtime.Scheme) runtime.Decoder {
-	scheme := loginConciergeScheme
-	codecs := serializer.NewCodecFactory(scheme)
-	respInfo, ok := runtime.SerializerInfoForMediaType(codecs.SupportedMediaTypes(), runtime.ContentTypeJSON)
-	if !ok {
-		panic(fmt.Errorf("unknown content type: %s ", runtime.ContentTypeJSON)) // static input, programmer error
-	}
-	return codecs.DecoderToVersion(respInfo.Serializer, schema.GroupVersion{
-		Group:   loginConciergeAPIGroup,
-		Version: loginapi.SchemeGroupVersion.Version,
-	})
 }
