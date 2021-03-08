@@ -9,18 +9,19 @@ import (
 	"crypto/x509/pkix"
 	"time"
 
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+
 	"go.pinniped.dev/internal/certauthority"
-	"go.pinniped.dev/internal/dynamiccert"
 )
 
 // CA is a type capable of issuing certificates.
 type CA struct {
-	provider dynamiccert.Provider
+	provider dynamiccertificates.CertKeyContentProvider
 }
 
 // New creates a new CA, ready to issue certs whenever the provided provider has a keypair to
 // provide.
-func New(provider dynamiccert.Provider) *CA {
+func New(provider dynamiccertificates.CertKeyContentProvider) *CA {
 	return &CA{
 		provider: provider,
 	}
