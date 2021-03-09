@@ -10,12 +10,9 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
-	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"go.pinniped.dev/internal/controller/apicerts"
@@ -42,7 +39,7 @@ import (
 )
 
 const (
-	impersonationProxyPort = "8444"
+	impersonationProxyPort = 8444
 	defaultHTTPSPort       = 443
 	oneYear                = 100 * 365 * 24 * time.Hour
 	caCommonName           = "Pinniped Impersonation Proxy CA"
@@ -69,14 +66,12 @@ type impersonatorConfigController struct {
 
 	labels                           map[string]string
 	clock                            clock.Clock
-	startTLSListenerFunc             StartTLSListenerFunc
-	httpHandlerFactory               func() (http.Handler, error)
 	impersonationSigningCertProvider dynamiccert.Provider
+	impersonatorFunc                 impersonator.FactoryFunc
 
-	server               *http.Server
-	hasControlPlaneNodes *bool
-	tlsCert              *tls.Certificate // always read/write using tlsCertMutex
-	tlsCertMutex         sync.RWMutex
+	hasControlPlaneNodes              *bool
+	serverStopCh                      chan struct{}
+	tlsServingCertDynamicCertProvider dynamiccert.Provider
 }
 
 type StartTLSListenerFunc func(network, listenAddress string, config *tls.Config) (net.Listener, error)
@@ -97,8 +92,7 @@ func NewImpersonatorConfigController(
 	caSecretName string,
 	labels map[string]string,
 	clock clock.Clock,
-	startTLSListenerFunc StartTLSListenerFunc,
-	httpHandlerFactory func() (http.Handler, error),
+	impersonatorFunc impersonator.FactoryFunc,
 	impersonationSignerSecretName string,
 	impersonationSigningCertProvider dynamiccert.Provider,
 ) controllerlib.Controller {
@@ -107,23 +101,23 @@ func NewImpersonatorConfigController(
 		controllerlib.Config{
 			Name: "impersonator-config-controller",
 			Syncer: &impersonatorConfigController{
-				namespace:                        namespace,
-				configMapResourceName:            configMapResourceName,
-				credentialIssuerResourceName:     credentialIssuerResourceName,
-				generatedLoadBalancerServiceName: generatedLoadBalancerServiceName,
-				tlsSecretName:                    tlsSecretName,
-				caSecretName:                     caSecretName,
-				impersonationSignerSecretName:    impersonationSignerSecretName,
-				k8sClient:                        k8sClient,
-				pinnipedAPIClient:                pinnipedAPIClient,
-				configMapsInformer:               configMapsInformer,
-				servicesInformer:                 servicesInformer,
-				secretsInformer:                  secretsInformer,
-				labels:                           labels,
-				clock:                            clock,
-				startTLSListenerFunc:             startTLSListenerFunc,
-				httpHandlerFactory:               httpHandlerFactory,
-				impersonationSigningCertProvider: impersonationSigningCertProvider,
+				namespace:                         namespace,
+				configMapResourceName:             configMapResourceName,
+				credentialIssuerResourceName:      credentialIssuerResourceName,
+				generatedLoadBalancerServiceName:  generatedLoadBalancerServiceName,
+				tlsSecretName:                     tlsSecretName,
+				caSecretName:                      caSecretName,
+				impersonationSignerSecretName:     impersonationSignerSecretName,
+				k8sClient:                         k8sClient,
+				pinnipedAPIClient:                 pinnipedAPIClient,
+				configMapsInformer:                configMapsInformer,
+				servicesInformer:                  servicesInformer,
+				secretsInformer:                   secretsInformer,
+				labels:                            labels,
+				clock:                             clock,
+				impersonationSigningCertProvider:  impersonationSigningCertProvider,
+				impersonatorFunc:                  impersonatorFunc,
+				tlsServingCertDynamicCertProvider: dynamiccert.New(),
 			},
 		},
 		withInformer(
@@ -223,9 +217,7 @@ func (c *impersonatorConfigController) doSync(ctx context.Context) (*v1alpha1.Cr
 			return nil, err
 		}
 	} else {
-		if err = c.ensureImpersonatorIsStopped(); err != nil {
-			return nil, err
-		}
+		c.ensureImpersonatorIsStopped()
 	}
 
 	if c.shouldHaveLoadBalancer(config) {
@@ -345,49 +337,35 @@ func (c *impersonatorConfigController) tlsSecretExists() (bool, *v1.Secret, erro
 }
 
 func (c *impersonatorConfigController) ensureImpersonatorIsStarted() error {
-	if c.server != nil {
+	if c.serverStopCh != nil {
 		return nil
 	}
 
-	handler, err := c.httpHandlerFactory()
+	plog.Info("Starting impersonation proxy", "port", impersonationProxyPort)
+	startImpersonatorFunc, err := c.impersonatorFunc(
+		impersonationProxyPort,
+		c.tlsServingCertDynamicCertProvider,
+		nil, // TODO give a ca provider based on c.impersonationSigningCertProvider
+	)
 	if err != nil {
 		return err
 	}
-
-	listener, err := c.startTLSListenerFunc("tcp", ":"+impersonationProxyPort, &tls.Config{
-		MinVersion: tls.VersionTLS12, // Allow v1.2 because clients like the default `curl` on MacOS don't support 1.3 yet.
-		GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return c.getTLSCert(), nil
-		},
-	})
+	c.serverStopCh = make(chan struct{})
+	err = startImpersonatorFunc(c.serverStopCh)
 	if err != nil {
 		return err
 	}
-
-	c.server = &http.Server{Handler: handler}
-
-	go func() {
-		plog.Info("Starting impersonation proxy", "port", impersonationProxyPort)
-		err = c.server.Serve(listener)
-		if errors.Is(err, http.ErrServerClosed) {
-			plog.Info("The impersonation proxy server has shut down")
-		} else {
-			plog.Error("Unexpected shutdown of the impersonation proxy server", err)
-		}
-	}()
 	return nil
 }
 
-func (c *impersonatorConfigController) ensureImpersonatorIsStopped() error {
-	if c.server != nil {
-		plog.Info("Stopping impersonation proxy", "port", impersonationProxyPort)
-		err := c.server.Close()
-		c.server = nil
-		if err != nil {
-			return err
-		}
+func (c *impersonatorConfigController) ensureImpersonatorIsStopped() {
+	if c.serverStopCh == nil {
+		return
 	}
-	return nil
+
+	plog.Info("Stopping impersonation proxy", "port", impersonationProxyPort)
+	close(c.serverStopCh)
+	c.serverStopCh = nil
 }
 
 func (c *impersonatorConfigController) ensureLoadBalancerIsStarted(ctx context.Context) error {
@@ -404,7 +382,7 @@ func (c *impersonatorConfigController) ensureLoadBalancerIsStarted(ctx context.C
 			Type: v1.ServiceTypeLoadBalancer,
 			Ports: []v1.ServicePort{
 				{
-					TargetPort: intstr.Parse(impersonationProxyPort),
+					TargetPort: intstr.FromInt(impersonationProxyPort),
 					Port:       defaultHTTPSPort,
 					Protocol:   v1.ProtocolTCP,
 				},
@@ -726,16 +704,16 @@ func (c *impersonatorConfigController) createNewTLSSecret(ctx context.Context, c
 func (c *impersonatorConfigController) loadTLSCertFromSecret(tlsSecret *v1.Secret) error {
 	certPEM := tlsSecret.Data[v1.TLSCertKey]
 	keyPEM := tlsSecret.Data[v1.TLSPrivateKeyKey]
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	_, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		c.setTLSCert(nil)
+		c.tlsServingCertDynamicCertProvider.Set(nil, nil)
 		return fmt.Errorf("could not parse TLS cert PEM data from Secret: %w", err)
 	}
 	plog.Info("Loading TLS certificates for impersonation proxy",
 		"certPEM", string(certPEM),
 		"secret", c.tlsSecretName,
 		"namespace", c.namespace)
-	c.setTLSCert(&tlsCert)
+	c.tlsServingCertDynamicCertProvider.Set(certPEM, keyPEM)
 	return nil
 }
 
@@ -755,7 +733,7 @@ func (c *impersonatorConfigController) ensureTLSSecretIsRemoved(ctx context.Cont
 		return err
 	}
 
-	c.setTLSCert(nil)
+	c.tlsServingCertDynamicCertProvider.Set(nil, nil)
 
 	return nil
 }
@@ -834,16 +812,4 @@ func (c *impersonatorConfigController) doSyncResult(nameInfo *certNameInfo, conf
 			},
 		}
 	}
-}
-
-func (c *impersonatorConfigController) setTLSCert(cert *tls.Certificate) {
-	c.tlsCertMutex.Lock()
-	defer c.tlsCertMutex.Unlock()
-	c.tlsCert = cert
-}
-
-func (c *impersonatorConfigController) getTLSCert() *tls.Certificate {
-	c.tlsCertMutex.RLock()
-	defer c.tlsCertMutex.RUnlock()
-	return c.tlsCert
 }

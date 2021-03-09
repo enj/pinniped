@@ -7,12 +7,10 @@ package controllermanager
 
 import (
 	"context"
-	"crypto/x509/pkix"
 	"fmt"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/clock"
-	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	k8sinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2/klogr"
@@ -20,7 +18,6 @@ import (
 	pinnipedclientset "go.pinniped.dev/generated/latest/client/concierge/clientset/versioned"
 	pinnipedinformers "go.pinniped.dev/generated/latest/client/concierge/informers/externalversions"
 	"go.pinniped.dev/internal/apiserviceref"
-	"go.pinniped.dev/internal/certauthority"
 	"go.pinniped.dev/internal/concierge/impersonator"
 	"go.pinniped.dev/internal/config/concierge"
 	"go.pinniped.dev/internal/controller/apicerts"
@@ -28,6 +25,7 @@ import (
 	"go.pinniped.dev/internal/controller/authenticator/cachecleaner"
 	"go.pinniped.dev/internal/controller/authenticator/jwtcachefiller"
 	"go.pinniped.dev/internal/controller/authenticator/webhookcachefiller"
+	"go.pinniped.dev/internal/controller/impersonatorconfig"
 	"go.pinniped.dev/internal/controller/kubecertagent"
 	"go.pinniped.dev/internal/controllerlib"
 	"go.pinniped.dev/internal/deploymentref"
@@ -35,7 +33,6 @@ import (
 	"go.pinniped.dev/internal/dynamiccert"
 	"go.pinniped.dev/internal/groupsuffix"
 	"go.pinniped.dev/internal/kubeclient"
-	"go.pinniped.dev/internal/plog"
 )
 
 const (
@@ -124,39 +121,6 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 	}
 	credentialIssuerLocationConfig := &kubecertagent.CredentialIssuerLocationConfig{
 		Name: c.NamesConfig.CredentialIssuer,
-	}
-
-	ca, err := certauthority.New(pkix.Name{CommonName: "mo"}, 365*24*time.Hour)
-	if err != nil {
-		return nil, fmt.Errorf("could not ca: %w", err)
-	}
-
-	pk, _ := ca.PrivateKeyToPEM()
-
-	plog.Warning("MO >>>>>>>>>>>>>>>>>>>>>", string(ca.Bundle()), string(pk))
-
-	servingCertCert, servingCertKey, err := ca.IssuePEM(pkix.Name{CommonName: "pinniped-concierge-proxy.pinniped-concierge.svc.cluster.local"}, []string{"pinniped-concierge-proxy.pinniped-concierge.svc.cluster.local"}, 365*24*time.Hour)
-	if err != nil {
-		return nil, fmt.Errorf("could not create serving cert: %w", err)
-	}
-
-	serving, err := dynamiccertificates.NewStaticCertKeyContent("pinniped-concierge-proxy.pinniped-concierge.svc.cluster.local", servingCertCert, servingCertKey)
-	if err != nil {
-		return nil, fmt.Errorf("could not create serving: %w", err)
-	}
-
-	caContent, err := dynamiccertificates.NewStaticCAContent("mo-bundle", ca.Bundle())
-	if err != nil {
-		return nil, fmt.Errorf("could not ca content: %w", err)
-	}
-
-	impersonationProxyRunner, err := impersonator.New(
-		8444, // TODO fix
-		serving,
-		caContent, // TODO implement using
-	)
-	if err != nil {
-		return nil, fmt.Errorf("could not create impersonation proxy: %w", err)
 	}
 
 	// Create controller manager.
@@ -310,41 +274,29 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 		).
 
 		// The impersonator configuration controller dynamically configures the impersonation proxy feature.
-		// WithController(
-		// 	impersonatorconfig.NewImpersonatorConfigController(
-		// 		c.ServerInstallationInfo.Namespace,
-		// 		c.NamesConfig.ImpersonationConfigMap,
-		// 		c.NamesConfig.CredentialIssuer,
-		// 		client.Kubernetes,
-		// 		client.PinnipedConcierge,
-		// 		informers.installationNamespaceK8s.Core().V1().ConfigMaps(),
-		// 		informers.installationNamespaceK8s.Core().V1().Services(),
-		// 		informers.installationNamespaceK8s.Core().V1().Secrets(),
-		// 		controllerlib.WithInformer,
-		// 		controllerlib.WithInitialEvent,
-		// 		c.NamesConfig.ImpersonationLoadBalancerService,
-		// 		c.NamesConfig.ImpersonationTLSCertificateSecret,
-		// 		c.NamesConfig.ImpersonationCACertificateSecret,
-		// 		c.Labels,
-		// 		clock.RealClock{},
-		// 		tls.Listen,
-		// 		func() (http.Handler, error) {
-		// 			impersonationProxyHandler, err := impersonator.New(
-		// 				klogr.New().WithName("impersonation-proxy"),
-		// 				8444, // TODO fix
-		// 				nil,
-		// 				c.ImpersonationSigningCertProvider, // TODO implement using
-		// 			)
-		// 			if err != nil {
-		// 				return nil, fmt.Errorf("could not create impersonation proxy: %w", err)
-		// 			}
-		// 			return impersonationProxyHandler, nil
-		// 		},
-		// 		c.NamesConfig.ImpersonationSignerSecret,
-		// 		c.ImpersonationSigningCertProvider,
-		// 	),
-		// 	singletonWorker,
-		// ).
+		WithController(
+			impersonatorconfig.NewImpersonatorConfigController(
+				c.ServerInstallationInfo.Namespace,
+				c.NamesConfig.ImpersonationConfigMap,
+				c.NamesConfig.CredentialIssuer,
+				client.Kubernetes,
+				client.PinnipedConcierge,
+				informers.installationNamespaceK8s.Core().V1().ConfigMaps(),
+				informers.installationNamespaceK8s.Core().V1().Services(),
+				informers.installationNamespaceK8s.Core().V1().Secrets(),
+				controllerlib.WithInformer,
+				controllerlib.WithInitialEvent,
+				c.NamesConfig.ImpersonationLoadBalancerService,
+				c.NamesConfig.ImpersonationTLSCertificateSecret,
+				c.NamesConfig.ImpersonationCACertificateSecret,
+				c.Labels,
+				clock.RealClock{},
+				impersonator.New,
+				c.NamesConfig.ImpersonationSignerSecret,
+				c.ImpersonationSigningCertProvider,
+			),
+			singletonWorker,
+		).
 		WithController(
 			apicerts.NewCertsManagerController(
 				c.ServerInstallationInfo.Namespace,
@@ -377,7 +329,6 @@ func PrepareControllers(c *Config) (func(ctx context.Context), error) {
 	return func(ctx context.Context) {
 		informers.startAndWaitForSync(ctx)
 		go controllerManager.Start(ctx)
-		go impersonationProxyRunner(ctx.Done())
 	}, nil
 }
 

@@ -17,11 +17,8 @@ import (
 	"net/http"
 	"reflect"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
-
-	"go.pinniped.dev/internal/controller/apicerts"
 
 	"github.com/sclevine/spec"
 	"github.com/sclevine/spec/report"
@@ -32,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	kubeinformers "k8s.io/client-go/informers"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	coretesting "k8s.io/client-go/testing"
@@ -39,33 +37,12 @@ import (
 	"go.pinniped.dev/generated/latest/apis/concierge/config/v1alpha1"
 	pinnipedfake "go.pinniped.dev/generated/latest/client/concierge/clientset/versioned/fake"
 	"go.pinniped.dev/internal/certauthority"
+	"go.pinniped.dev/internal/controller/apicerts"
 	"go.pinniped.dev/internal/controllerlib"
 	"go.pinniped.dev/internal/dynamiccert"
 	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/testutil"
 )
-
-type tlsListenerWrapper struct {
-	listener   net.Listener
-	closeError error
-}
-
-func (t *tlsListenerWrapper) Accept() (net.Conn, error) {
-	return t.listener.Accept()
-}
-
-func (t *tlsListenerWrapper) Close() error {
-	if t.closeError != nil {
-		// Really close the connection and then "pretend" that there was an error during close.
-		_ = t.listener.Close()
-		return t.closeError
-	}
-	return t.listener.Close()
-}
-
-func (t *tlsListenerWrapper) Addr() net.Addr {
-	return t.listener.Addr()
-}
 
 func TestImpersonatorConfigControllerOptions(t *testing.T) {
 	spec.Run(t, "options", func(t *testing.T, when spec.G, it spec.S) {
@@ -106,7 +83,6 @@ func TestImpersonatorConfigControllerOptions(t *testing.T) {
 				generatedLoadBalancerServiceName,
 				tlsSecretName,
 				caSecretName,
-				nil,
 				nil,
 				nil,
 				nil,
@@ -312,47 +288,89 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		var cancelContext context.Context
 		var cancelContextCancelFunc context.CancelFunc
 		var syncContext *controllerlib.Context
-		var startTLSListenerFuncWasCalled int
-		var startTLSListenerFuncError error
-		var startTLSListenerUponCloseError error
-		var httpHandlerFactoryFuncError error
+		var impersonatorFuncWasCalled int
+		var impersonatorFuncError error
+		var impersonatorFuncReturnedFuncError error
 		var startedTLSListener net.Listener
 		var frozenNow time.Time
 		var signingCertProvider dynamiccert.Provider
 		var signingCACertPEM, signingCAKeyPEM []byte
 		var signingCASecret *corev1.Secret
+		var testHTTPServer *http.Server
 
-		var startTLSListenerFunc = func(network, listenAddress string, config *tls.Config) (net.Listener, error) {
-			startTLSListenerFuncWasCalled++
-			r.Equal("tcp", network)
-			r.Equal(":8444", listenAddress)
-			r.Equal(uint16(tls.VersionTLS12), config.MinVersion)
-			if startTLSListenerFuncError != nil {
-				return nil, startTLSListenerFuncError
+		var impersonatorFunc = func(
+			port int,
+			dynamicCertProvider dynamiccertificates.CertKeyContentProvider,
+			impersonationProxySignerCA dynamiccertificates.CAContentProvider,
+		) (func(stopCh <-chan struct{}) error, error) {
+			impersonatorFuncWasCalled++
+			r.Equal(8444, port)
+
+			if impersonatorFuncError != nil {
+				return nil, impersonatorFuncError
 			}
-			var err error
-			startedTLSListener, err = tls.Listen(network, localhostIP+":0", config) // automatically choose the port for unit tests
-			r.NoError(err)
-			return &tlsListenerWrapper{listener: startedTLSListener, closeError: startTLSListenerUponCloseError}, nil
+
+			// Return a func that starts a fake server when called, and shuts down the fake server when stopCh is closed.
+			// This fake server is enough like the real impersonation proxy server for this unit test because it
+			// uses the supplied providers to serve TLS. The goal of this unit test is to make sure that the server
+			// was started/stopped/configured correctly, not to test the actual impersonation behavior.
+			return func(stopCh <-chan struct{}) error {
+				if impersonatorFuncReturnedFuncError != nil {
+					return impersonatorFuncReturnedFuncError
+				}
+				var err error
+				// automatically choose the port for unit tests
+				startedTLSListener, err = tls.Listen("tcp", localhostIP+":0", &tls.Config{
+					MinVersion: tls.VersionTLS12,
+					GetCertificate: func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+						certPEM, keyPEM := dynamicCertProvider.CurrentCertKeyContent()
+						if certPEM != nil && keyPEM != nil {
+							tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+							r.NoError(err)
+							return &tlsCert, nil
+						}
+						return nil, nil // no cached TLS certs
+					},
+					// TODO do something with impersonationProxySignerCA for client cert auth
+				})
+				r.NoError(err)
+				testHTTPServer = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+					_, err := fmt.Fprint(w, fakeServerResponseBody)
+					r.NoError(err)
+				})}
+				// Start serving requests in the background.
+				go func() {
+					err := testHTTPServer.Serve(startedTLSListener)
+					if !errors.Is(err, http.ErrServerClosed) {
+						t.Log("Got an unexpected error while starting the fake http server!")
+						r.NoError(err) // causes the test to crash, which is good enough because this should never happen
+					}
+				}()
+				// Start waiting for the stopCh to be closed in the background, and kill the server when that happens.
+				go func() {
+					<-stopCh
+					err := testHTTPServer.Close()
+					t.Log("Got an unexpected error while stopping the fake http server!")
+					r.NoError(err) // causes the test to crash, which is good enough because this should never happen
+				}()
+				return nil
+			}, nil
 		}
 
 		var testServerAddr = func() string {
 			return startedTLSListener.Addr().String()
 		}
 
-		var closeTLSListener = func() {
-			if startedTLSListener != nil {
-				err := startedTLSListener.Close()
-				// Ignore when the production code has already closed the server because there is nothing to
-				// clean up in that case.
-				if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
-					r.NoError(err)
-				}
+		var closeTestHTTPServer = func() {
+			// If a test left it running, then close it.
+			if testHTTPServer != nil {
+				err := testHTTPServer.Close()
+				r.NoError(err)
 			}
 		}
 
 		var requireTLSServerIsRunning = func(caCrt []byte, addr string, dnsOverrides map[string]string) {
-			r.Greater(startTLSListenerFuncWasCalled, 0)
+			r.Greater(impersonatorFuncWasCalled, 0)
 
 			realDialer := &net.Dialer{}
 			overrideDialContext := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -400,7 +418,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		}
 
 		var requireTLSServerIsRunningWithoutCerts = func() {
-			r.Greater(startTLSListenerFuncWasCalled, 0)
+			r.Greater(impersonatorFuncWasCalled, 0)
 			tr := &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 			}
@@ -421,7 +439,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		}
 
 		var requireTLSServerIsNoLongerRunning = func() {
-			r.Greater(startTLSListenerFuncWasCalled, 0)
+			r.Greater(impersonatorFuncWasCalled, 0)
 			var err error
 			expectedErrorRegex := "dial tcp .*: connect: connection refused"
 			expectedErrorRegexCompiled, err := regexp.Compile(expectedErrorRegex)
@@ -439,7 +457,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		}
 
 		var requireTLSServerWasNeverStarted = func() {
-			r.Equal(0, startTLSListenerFuncWasCalled)
+			r.Equal(0, impersonatorFuncWasCalled)
 		}
 
 		// Defer starting the informers until the last possible moment so that the
@@ -462,13 +480,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				caSecretName,
 				labels,
 				clock.NewFakeClock(frozenNow),
-				startTLSListenerFunc,
-				func() (http.Handler, error) {
-					return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-						_, err := fmt.Fprint(w, fakeServerResponseBody)
-						r.NoError(err)
-					}), httpHandlerFactoryFuncError
-				},
+				impersonatorFunc,
 				caSignerName,
 				signingCertProvider,
 			)
@@ -905,7 +917,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		it.After(func() {
 			cancelContextCancelFunc()
-			closeTLSListener()
+			closeTestHTTPServer()
 		})
 
 		when("the ConfigMap does not yet exist in the installation namespace or it was deleted (defaults to auto mode)", func() {
@@ -1284,11 +1296,11 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireSigningCertProviderIsEmpty()
 					})
 
-					it("returns an error when the tls listener fails to start", func() {
-						startTLSListenerFuncError = errors.New("tls error")
+					it("returns an error when the impersonation TLS server fails to start", func() {
+						impersonatorFuncError = errors.New("impersonation server start error")
 						startInformersAndController()
-						r.EqualError(runControllerSync(), "tls error")
-						requireCredentialIssuer(newErrorStrategy("tls error"))
+						r.EqualError(runControllerSync(), "impersonation server start error")
+						requireCredentialIssuer(newErrorStrategy("impersonation server start error"))
 						requireSigningCertProviderIsEmpty()
 					})
 				})
@@ -1312,11 +1324,11 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireSigningCertProviderIsEmpty()
 					})
 
-					it("returns an error when the tls listener fails to start", func() {
-						startTLSListenerFuncError = errors.New("tls error")
+					it("returns an error when the impersonation TLS server fails to start", func() {
+						impersonatorFuncError = errors.New("impersonation server start error")
 						startInformersAndController()
-						r.EqualError(runControllerSync(), "tls error")
-						requireCredentialIssuer(newErrorStrategy("tls error"))
+						r.EqualError(runControllerSync(), "impersonation server start error")
+						requireCredentialIssuer(newErrorStrategy("impersonation server start error"))
 						requireSigningCertProviderIsEmpty()
 					})
 				})
@@ -1659,26 +1671,6 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					requireCredentialIssuer(newPendingStrategy())
 					requireSigningCertProviderIsEmpty()
 				})
-
-				when("there is an error while shutting down the server", func() {
-					it.Before(func() {
-						startTLSListenerUponCloseError = errors.New("fake server close error")
-					})
-
-					it("returns the error from the sync function", func() {
-						startInformersAndController()
-						r.NoError(runControllerSync())
-						requireTLSServerIsRunningWithoutCerts()
-
-						// Update the configmap.
-						updateImpersonatorConfigMapInInformerAndWait(configMapResourceName, "mode: disabled", kubeInformers.Core().V1().ConfigMaps())
-
-						r.EqualError(runControllerSync(), "fake server close error")
-						requireTLSServerIsNoLongerRunning()
-						requireCredentialIssuer(newErrorStrategy("fake server close error"))
-						requireSigningCertProviderIsEmpty()
-					})
-				})
 			})
 
 			when("the endpoint switches from specified, to not specified, to specified again", func() {
@@ -1780,8 +1772,8 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
 
 				r.NoError(runControllerSync())
-				r.Equal(1, startTLSListenerFuncWasCalled) // wasn't started a second time
-				requireTLSServerIsRunningWithoutCerts()   // still running
+				r.Equal(1, impersonatorFuncWasCalled)   // wasn't started a second time
+				requireTLSServerIsRunningWithoutCerts() // still running
 				requireCredentialIssuer(newPendingStrategy())
 				requireSigningCertProviderIsEmpty()
 				r.Len(kubeAPIClient.Actions(), 3) // no new API calls
@@ -1805,7 +1797,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				updateLoadBalancerServiceInInformerAndWait(loadBalancerServiceName, []corev1.LoadBalancerIngress{{IP: localhostIP}}, kubeInformers.Core().V1().Services())
 
 				r.NoError(runControllerSync())
-				r.Equal(1, startTLSListenerFuncWasCalled) // wasn't started a second time
+				r.Equal(1, impersonatorFuncWasCalled) // wasn't started a second time
 				r.Len(kubeAPIClient.Actions(), 4)
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[3], ca) // uses the ca from last time
 				requireTLSServerIsRunning(ca, testServerAddr(), nil)       // running with certs now
@@ -1816,7 +1808,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[3], kubeInformers.Core().V1().Secrets())
 
 				r.NoError(runControllerSync())
-				r.Equal(1, startTLSListenerFuncWasCalled)            // wasn't started again
+				r.Equal(1, impersonatorFuncWasCalled)                // wasn't started again
 				r.Len(kubeAPIClient.Actions(), 4)                    // no more actions
 				requireTLSServerIsRunning(ca, testServerAddr(), nil) // still running
 				requireCredentialIssuer(newSuccessStrategy(localhostIP, ca))
@@ -1842,7 +1834,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				updateLoadBalancerServiceInInformerAndWait(loadBalancerServiceName, []corev1.LoadBalancerIngress{{IP: localhostIP, Hostname: hostname}}, kubeInformers.Core().V1().Services())
 
 				r.NoError(runControllerSync())
-				r.Equal(1, startTLSListenerFuncWasCalled) // wasn't started a second time
+				r.Equal(1, impersonatorFuncWasCalled) // wasn't started a second time
 				r.Len(kubeAPIClient.Actions(), 4)
 				requireTLSSecretWasCreated(kubeAPIClient.Actions()[3], ca)                                         // uses the ca from last time
 				requireTLSServerIsRunning(ca, hostname, map[string]string{hostname + httpsPort: testServerAddr()}) // running with certs now
@@ -1853,7 +1845,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[3], kubeInformers.Core().V1().Secrets())
 
 				r.NoError(runControllerSync())
-				r.Equal(1, startTLSListenerFuncWasCalled)                                                          // wasn't started a third time
+				r.Equal(1, impersonatorFuncWasCalled)                                                              // wasn't started a third time
 				r.Len(kubeAPIClient.Actions(), 4)                                                                  // no more actions
 				requireTLSServerIsRunning(ca, hostname, map[string]string{hostname + httpsPort: testServerAddr()}) // still running
 				requireCredentialIssuer(newSuccessStrategy(hostname, ca))
@@ -1905,18 +1897,17 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			})
 		})
 
-		when("the http handler factory function returns an error", func() {
+		when("the impersonator start function returned by the impersonatorFunc returns an error", func() {
 			it.Before(func() {
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
-				httpHandlerFactoryFuncError = errors.New("some factory error")
+				impersonatorFuncReturnedFuncError = errors.New("some impersonator startup error")
 			})
 
 			it("returns an error", func() {
 				startInformersAndController()
-				r.EqualError(runControllerSync(), "some factory error")
-				requireCredentialIssuer(newErrorStrategy("some factory error"))
+				r.EqualError(runControllerSync(), "some impersonator startup error")
+				requireCredentialIssuer(newErrorStrategy("some impersonator startup error"))
 				requireSigningCertProviderIsEmpty()
-				requireTLSServerWasNeverStarted()
 			})
 		})
 

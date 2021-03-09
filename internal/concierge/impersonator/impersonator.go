@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"go.pinniped.dev/internal/plog"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
@@ -28,7 +27,19 @@ import (
 
 	"go.pinniped.dev/internal/httputil/securityheader"
 	"go.pinniped.dev/internal/kubeclient"
+	"go.pinniped.dev/internal/plog"
 )
+
+// FactoryFunc is a function which can create an impersonator server.
+// It returns a function which will start the impersonator server.
+// That start function takes a stopCh which can be used to stop the server.
+// Once a server has been stopped, don't start it again using the start function.
+// Instead, call the factory function again to get a new start function.
+type FactoryFunc func(
+	port int,
+	dynamicCertProvider dynamiccertificates.CertKeyContentProvider,
+	impersonationProxySignerCA dynamiccertificates.CAContentProvider,
+) (func(stopCh <-chan struct{}) error, error)
 
 func New(
 	port int,
