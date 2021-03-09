@@ -15,7 +15,9 @@ import (
 	"strings"
 	"time"
 
+	"go.pinniped.dev/internal/constable"
 	"go.pinniped.dev/internal/controller/apicerts"
+	"k8s.io/apimachinery/pkg/util/errors"
 
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -71,6 +73,7 @@ type impersonatorConfigController struct {
 
 	hasControlPlaneNodes              *bool
 	serverStopCh                      chan struct{}
+	errorCh                           chan error
 	tlsServingCertDynamicCertProvider dynamiccert.Provider
 }
 
@@ -141,13 +144,14 @@ func NewImpersonatorConfigController(
 			Namespace: namespace,
 			Name:      configMapResourceName,
 		}),
+		// TODO fix these controller options to make this a singleton queue
 	)
 }
 
 func (c *impersonatorConfigController) Sync(syncCtx controllerlib.Context) error {
 	plog.Debug("Starting impersonatorConfigController Sync")
 
-	strategy, err := c.doSync(syncCtx.Context)
+	strategy, err := c.doSync(syncCtx)
 
 	if err != nil {
 		strategy = &v1alpha1.CredentialIssuerStrategy{
@@ -191,7 +195,9 @@ type certNameInfo struct {
 	clientEndpoint string
 }
 
-func (c *impersonatorConfigController) doSync(ctx context.Context) (*v1alpha1.CredentialIssuerStrategy, error) {
+func (c *impersonatorConfigController) doSync(syncCtx controllerlib.Context) (*v1alpha1.CredentialIssuerStrategy, error) {
+	ctx := syncCtx.Context
+
 	config, err := c.loadImpersonationProxyConfiguration()
 	if err != nil {
 		return nil, err
@@ -211,11 +217,13 @@ func (c *impersonatorConfigController) doSync(ctx context.Context) (*v1alpha1.Cr
 	}
 
 	if c.shouldHaveImpersonator(config) {
-		if err = c.ensureImpersonatorIsStarted(); err != nil {
+		if err = c.ensureImpersonatorIsStarted(syncCtx); err != nil {
 			return nil, err
 		}
 	} else {
-		c.ensureImpersonatorIsStopped()
+		if err = c.ensureImpersonatorIsStopped(true); err != nil { // TODO test this
+			return nil, err
+		}
 	}
 
 	if c.shouldHaveLoadBalancer(config) {
@@ -334,37 +342,61 @@ func (c *impersonatorConfigController) tlsSecretExists() (bool, *v1.Secret, erro
 	return true, secret, nil
 }
 
-func (c *impersonatorConfigController) ensureImpersonatorIsStarted() error {
+func (c *impersonatorConfigController) ensureImpersonatorIsStarted(syncCtx controllerlib.Context) error {
 	if c.serverStopCh != nil {
-		return nil
+		select {
+		case runningErr := <-c.errorCh:
+			if runningErr == nil {
+				runningErr = constable.Error("unexpected shutdown of proxy server")
+			}
+			close(c.errorCh)
+			stoppingErr := c.ensureImpersonatorIsStopped(false)
+			return errors.NewAggregate([]error{runningErr, stoppingErr})
+		default:
+			return nil
+		}
 	}
 
 	plog.Info("Starting impersonation proxy", "port", impersonationProxyPort)
 	startImpersonatorFunc, err := c.impersonatorFunc(
 		impersonationProxyPort,
 		c.tlsServingCertDynamicCertProvider,
-		nil, // TODO give a ca provider based on c.impersonationSigningCertProvider
+		nil, // TODO write tests
+	//	dynamiccert.NewCAProvider(c.impersonationSigningCertProvider),
 	)
 	if err != nil {
 		return err
 	}
+
 	c.serverStopCh = make(chan struct{})
-	// TODO this is wrong, the start func blocks on stop so it needs to be run in a different go routine
-	err = startImpersonatorFunc(c.serverStopCh)
-	if err != nil {
-		return err
-	}
+	c.errorCh = make(chan error)
+
+	go func() {
+		startOrStopErr := startImpersonatorFunc(c.serverStopCh)
+		syncCtx.Queue.AddRateLimited(syncCtx.Key)
+		c.errorCh <- startOrStopErr
+	}()
+
 	return nil
 }
 
-func (c *impersonatorConfigController) ensureImpersonatorIsStopped() {
+func (c *impersonatorConfigController) ensureImpersonatorIsStopped(shouldCloseErrChan bool) error {
 	if c.serverStopCh == nil {
-		return
+		return nil
 	}
 
 	plog.Info("Stopping impersonation proxy", "port", impersonationProxyPort)
 	close(c.serverStopCh)
+	stopErr := <-c.errorCh
+
+	if shouldCloseErrChan {
+		close(c.errorCh)
+	}
+
 	c.serverStopCh = nil
+	c.errorCh = nil
+
+	return stopErr
 }
 
 func (c *impersonatorConfigController) ensureLoadBalancerIsStarted(ctx context.Context) error {

@@ -297,6 +297,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		var signingCACertPEM, signingCAKeyPEM []byte
 		var signingCASecret *corev1.Secret
 		var testHTTPServer *http.Server
+		var queue *testQueue
 
 		var impersonatorFunc = func(
 			port int,
@@ -346,18 +347,23 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						r.NoError(err) // causes the test to crash, which is good enough because this should never happen
 					}
 				}()
-				// Start waiting for the stopCh to be closed in the background, and kill the server when that happens.
-				go func() {
-					<-stopCh
-					err := testHTTPServer.Close()
-					t.Log("Got an unexpected error while stopping the fake http server!")
-					r.NoError(err) // causes the test to crash, which is good enough because this should never happen
-				}()
+
+				// Start waiting for the stopCh to be closed in the foreground, and kill the server when that happens.
+				<-stopCh
+
+				err = testHTTPServer.Close()
+				t.Log("Got an unexpected error while stopping the fake http server!")
+				r.NoError(err) // causes the test to crash, which is good enough because this should never happen
+
 				return nil
 			}, nil
 		}
 
 		var testServerAddr = func() string {
+			require.Eventually(t, func() bool {
+				return startedTLSListener != nil
+			}, 20*time.Second, 50*time.Millisecond, "TLS listener never became not nil")
+
 			return startedTLSListener.Addr().String()
 		}
 
@@ -446,7 +452,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			r.NoError(err)
 			assert.Eventually(t, func() bool {
 				_, err = tls.Dial(
-					startedTLSListener.Addr().Network(),
+					"tcp",
 					testServerAddr(),
 					&tls.Config{InsecureSkipVerify: true}, //nolint:gosec
 				)
@@ -493,6 +499,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					Namespace: installedInNamespace,
 					Name:      configMapResourceName,
 				},
+				Queue: queue,
 			}
 
 			// Must start informers before calling TestRunSynchronously()
@@ -897,6 +904,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 
 		it.Before(func() {
 			r = require.New(t)
+			queue = &testQueue{}
 			cancelContext, cancelContextCancelFunc = context.WithCancel(context.Background())
 			kubeInformerClient = kubernetesfake.NewSimpleClientset()
 			kubeInformers = kubeinformers.NewSharedInformerFactoryWithOptions(kubeInformerClient, 0,
@@ -1903,10 +1911,40 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				impersonatorFuncReturnedFuncError = errors.New("some impersonator startup error")
 			})
 
-			it("returns an error", func() {
+			it("returns an error on the second run", func() {
 				startInformersAndController()
+				// The failure happens in a background goroutine, so the first sync succeeds.
+				r.NoError(runControllerSync())
+				// Eventually the server is not really running, because the startup failed.
+				r.Nil(startedTLSListener)
+				r.Equal(impersonatorFuncWasCalled, 1)
+				r.Len(kubeAPIClient.Actions(), 3)
+				requireNodesListed(kubeAPIClient.Actions()[0])
+				requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
+				requireCASecretWasCreated(kubeAPIClient.Actions()[2])
+				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
+
+				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
+				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
+
+				// The controller should have requested to re-enqueue the original sync key.
+				r.Eventually(func() bool {
+					return syncContext.Key == queue.key
+				}, 10*time.Second, 10*time.Millisecond)
+
+				// The next sync should error because the server died in the background
 				r.EqualError(runControllerSync(), "some impersonator startup error")
 				requireCredentialIssuer(newErrorStrategy("some impersonator startup error"))
+				requireSigningCertProviderIsEmpty()
+
+				// pretend the server is not going to die anymore
+				impersonatorFuncReturnedFuncError = nil
+
+				// now everything should be working correctly
+				r.NoError(runControllerSync())
+				requireTLSServerIsRunningWithoutCerts()
+				requireCredentialIssuer(newPendingStrategy())
 				requireSigningCertProviderIsEmpty()
 			})
 		})
@@ -2304,4 +2342,22 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			})
 		})
 	}, spec.Parallel(), spec.Report(report.Terminal{}))
+}
+
+type testQueue struct {
+	key controllerlib.Key
+
+	controllerlib.Queue
+}
+
+func (q *testQueue) AddRateLimited(key controllerlib.Key) {
+	if q.key != (controllerlib.Key{}) {
+		panic("called more than once")
+	}
+
+	if key == (controllerlib.Key{}) {
+		panic("unexpected empty key")
+	}
+
+	q.key = key
 }
