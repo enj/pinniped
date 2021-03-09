@@ -74,8 +74,6 @@ type impersonatorConfigController struct {
 	tlsServingCertDynamicCertProvider dynamiccert.Provider
 }
 
-type StartTLSListenerFunc func(network, listenAddress string, config *tls.Config) (net.Listener, error)
-
 func NewImpersonatorConfigController(
 	namespace string,
 	configMapResourceName string,
@@ -351,6 +349,7 @@ func (c *impersonatorConfigController) ensureImpersonatorIsStarted() error {
 		return err
 	}
 	c.serverStopCh = make(chan struct{})
+	// TODO this is wrong, the start func blocks on stop so it needs to be run in a different go routine
 	err = startImpersonatorFunc(c.serverStopCh)
 	if err != nil {
 		return err

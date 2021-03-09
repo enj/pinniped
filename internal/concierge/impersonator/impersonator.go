@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 
+	"go.pinniped.dev/internal/constable"
 	"go.pinniped.dev/internal/httputil/securityheader"
 	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/plog"
@@ -41,12 +42,18 @@ type FactoryFunc func(
 	impersonationProxySignerCA dynamiccertificates.CAContentProvider,
 ) (func(stopCh <-chan struct{}) error, error)
 
+// for unit testing
+var (
+	clientOpts []kubeclient.Option
+	recOpts    func(*genericoptions.RecommendedOptions)
+)
+
 func New(
 	port int,
-	dynamicCertProvider dynamiccertificates.CertKeyContentProvider,
-	impersonationProxySignerCA dynamiccertificates.CAContentProvider,
+	dynamicCertProvider dynamiccertificates.CertKeyContentProvider, //  TODO: we need to check those optional interfaces and see what we need to implement
+	impersonationProxySignerCA dynamiccertificates.CAContentProvider, //  TODO: we need to check those optional interfaces and see what we need to implement
 ) (func(stopCh <-chan struct{}) error, error) {
-	// bare minimum server side scheme
+	// bare minimum server side scheme to allow for status messages to be encoded
 	scheme := runtime.NewScheme()
 	metav1.AddToGroupVersion(scheme, metav1.Unversioned)
 	codecs := serializer.NewCodecFactory(scheme)
@@ -58,17 +65,16 @@ func New(
 		defaultEtcdPathPrefix,
 		codecs.LegacyCodec(),
 	)
-	recommendedOptions.Etcd = nil // turn off etcd storage because we don't need it yet
-	recommendedOptions.SecureServing.ServerCert.GeneratedCert = dynamicCertProvider
+	recommendedOptions.Etcd = nil                                                   // turn off etcd storage because we don't need it yet
+	recommendedOptions.SecureServing.ServerCert.GeneratedCert = dynamicCertProvider // serving certs (end user facing)
 	recommendedOptions.SecureServing.BindPort = port
 
-	// wire up the impersonation proxy signer CA as a valid authenticator
+	// wire up the impersonation proxy signer CA as a valid authenticator for client cert auth
 	// TODO fix comments
-	kubeClient, err := kubeclient.New()
+	kubeClient, err := kubeclient.New(clientOpts...)
 	if err != nil {
 		return nil, err
 	}
-
 	kubeClientCA, err := dynamiccertificates.NewDynamicCAFromConfigMapController("client-ca", metav1.NamespaceSystem, "extension-apiserver-authentication", "client-ca-file", kubeClient.Kubernetes)
 	if err != nil {
 		return nil, err
@@ -76,12 +82,26 @@ func New(
 	recommendedOptions.Authentication.ClientCert.ClientCA = "---irrelevant-but-needs-to-be-non-empty---"
 	recommendedOptions.Authentication.ClientCert.CAContentProvider = dynamiccertificates.NewUnionCAContentProvider(impersonationProxySignerCA, kubeClientCA)
 
+	if recOpts != nil {
+		recOpts(recommendedOptions)
+	}
+
 	serverConfig := genericapiserver.NewRecommendedConfig(codecs)
 	if err := recommendedOptions.ApplyTo(serverConfig); err != nil {
 		return nil, err
 	}
 
-	impersonationProxy, err := newImpersonationReverseProxy(rest.CopyConfig(kubeClient.JSONConfig))
+	// loopback authentication to this server does not really make sense since we just proxy everything to KAS
+	// thus we replace loopback connection config with one that does direct connections to KAS
+	// loopback config is mainly used by post start hooks, so this is mostly future proofing
+	serverConfig.LoopbackClientConfig = rest.CopyConfig(kubeClient.ProtoConfig) // assume proto is safe (hooks can override)
+	// remove the bearer token so our authorizer does not get stomped on by AuthorizeClientBearerToken
+	// see sanity checks at the end of this function
+	serverConfig.LoopbackClientConfig.BearerToken = ""
+
+	// assume proto config is safe because transport level configs do not use rest.ContentConfig
+	// thus if we are interacting with actual APIs, they should be using pre-built clients
+	impersonationProxy, err := newImpersonationReverseProxy(rest.CopyConfig(kubeClient.ProtoConfig))
 	if err != nil {
 		return nil, err
 	}
@@ -95,31 +115,53 @@ func New(
 	}
 
 	// TODO integration test this authorizer logic with system:masters + double impersonation
+	// overwrite the delegating authorizer with one that only cares about impersonation
 	// empty string is disallowed because request info has had bugs in the past where it would leave it empty
 	disallowedVerbs := sets.NewString("", "impersonate")
-	noImpersonationAuthorizer := authorizer.AuthorizerFunc(func(a authorizer.Attributes) (authorizer.Decision, string, error) {
-		// supporting impersonation is not hard, it would just require a bunch of testing
-		// and configuring the audit layer (to preserve the caller) which we can do later
-		// we would also want to delete the incoming impersonation headers
-		if disallowedVerbs.Has(a.GetVerb()) {
-			return authorizer.DecisionDeny, "impersonation is not allowed or invalid verb", nil
-		}
+	noImpersonationAuthorizer := &comparableAuthorizer{
+		AuthorizerFunc: func(a authorizer.Attributes) (authorizer.Decision, string, error) {
+			// supporting impersonation is not hard, it would just require a bunch of testing
+			// and configuring the audit layer (to preserve the caller) which we can do later
+			// we would also want to delete the incoming impersonation headers
+			// instead of overwriting the delegating authorizer, we would
+			// actually use it to make the impersonation authorization checks
+			if disallowedVerbs.Has(a.GetVerb()) {
+				return authorizer.DecisionDeny, "impersonation is not allowed or invalid verb", nil
+			}
 
-		return authorizer.DecisionAllow, "defering authorization to kube API server", nil
-	})
+			return authorizer.DecisionAllow, "deferring authorization to kube API server", nil
+		},
+	}
 	// TODO write a big comment explaining wth this is doing
 	serverConfig.Authorization.Authorizer = noImpersonationAuthorizer
-	completedConfig := serverConfig.Complete()
-	completedConfig.Authorization.Authorizer = noImpersonationAuthorizer
 
-	impersonationProxyServer, err := completedConfig.New("impersonation-proxy", genericapiserver.NewEmptyDelegate())
+	impersonationProxyServer, err := serverConfig.Complete().New("impersonation-proxy", genericapiserver.NewEmptyDelegate())
 	if err != nil {
 		return nil, err
 	}
 
-	runFunc := impersonationProxyServer.PrepareRun().Run
+	preparedRun := impersonationProxyServer.PrepareRun()
 
-	return runFunc, nil
+	// wait until the very end to do sanity checks
+
+	if preparedRun.Authorizer != noImpersonationAuthorizer {
+		return nil, constable.Error("invalid mutation of impersonation authorizer detected")
+	}
+
+	// assert that we have a functioning token file to use and no bearer token
+	if len(preparedRun.LoopbackClientConfig.BearerToken) != 0 || len(preparedRun.LoopbackClientConfig.BearerTokenFile) == 0 {
+		return nil, constable.Error("invalid impersonator loopback rest config has wrong bearer token semantics")
+	}
+
+	// TODO make sure this is closed on error
+	_ = preparedRun.SecureServingInfo.Listener
+
+	return preparedRun.Run, nil
+}
+
+// no-op wrapping around AuthorizerFunc to allow for comparisons
+type comparableAuthorizer struct {
+	authorizer.AuthorizerFunc
 }
 
 func newImpersonationReverseProxy(restConfig *rest.Config) (http.Handler, error) {

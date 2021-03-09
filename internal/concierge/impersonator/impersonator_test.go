@@ -5,19 +5,133 @@ package impersonator
 
 import (
 	"context"
+	"crypto/x509/pkix"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/features"
+	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+	genericoptions "k8s.io/apiserver/pkg/server/options"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd/api"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
+	"go.pinniped.dev/internal/certauthority"
+	"go.pinniped.dev/internal/kubeclient"
 	"go.pinniped.dev/internal/testutil"
 )
+
+func TestNew(t *testing.T) {
+	const port = 8444
+
+	ca, err := certauthority.New(pkix.Name{CommonName: "ca"}, time.Hour)
+	require.NoError(t, err)
+	cert, key, err := ca.IssuePEM(pkix.Name{CommonName: "example.com"}, []string{"example.com"}, time.Hour)
+	require.NoError(t, err)
+	certKeyContent, err := dynamiccertificates.NewStaticCertKeyContent("cert-key", cert, key)
+	require.NoError(t, err)
+	caContent, err := dynamiccertificates.NewStaticCAContent("ca", ca.Bundle())
+	require.NoError(t, err)
+
+	// punch out just enough stuff to make New actually run without error-ing
+	savedClientOpts := clientOpts
+	savedRecOpts := recOpts
+	defer func() {
+		clientOpts = savedClientOpts
+		recOpts = savedRecOpts
+	}()
+	recOpts = func(options *genericoptions.RecommendedOptions) {
+		options.Authentication.RemoteKubeConfigFileOptional = true
+		options.Authorization.RemoteKubeConfigFileOptional = true
+		options.CoreAPI = nil
+		options.Admission = nil
+	}
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.APIPriorityAndFairness, false)()
+
+	tests := []struct {
+		name       string
+		clientOpts []kubeclient.Option
+		wantErr    string
+	}{
+		{
+			name: "happy path",
+			clientOpts: []kubeclient.Option{
+				kubeclient.WithConfig(&rest.Config{
+					BearerToken:     "should-be-ignored",
+					BearerTokenFile: "required-to-be-set",
+				}),
+			},
+		},
+		{
+			name: "no bearer token file",
+			clientOpts: []kubeclient.Option{
+				kubeclient.WithConfig(&rest.Config{
+					BearerToken: "should-be-ignored",
+				}),
+			},
+			wantErr: "invalid impersonator loopback rest config has wrong bearer token semantics",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			// this is a serial test
+			defer func() {
+				clientOpts = savedClientOpts
+			}()
+			clientOpts = tt.clientOpts
+
+			runner, constructionErr := New(port, certKeyContent, caContent)
+
+			if len(tt.wantErr) != 0 {
+				require.EqualError(t, constructionErr, tt.wantErr)
+				require.Nil(t, runner)
+			} else {
+				require.NoError(t, constructionErr)
+				require.NotNil(t, runner)
+
+				stopCh := make(chan struct{})
+				errCh := make(chan error)
+				go func() {
+					stopErr := runner(stopCh)
+					errCh <- stopErr
+				}()
+
+				select {
+				case unexpectedExit := <-errCh:
+					t.Errorf("unexpected exit, err=%v (even nil error is failure)", unexpectedExit)
+				case <-time.After(10 * time.Second):
+				}
+
+				close(stopCh)
+				exitErr := <-errCh
+				require.NoError(t, exitErr)
+			}
+
+			// assert listener is closed is both cases above by trying to make another one on the same port
+			ln, _, listenErr := genericoptions.CreateListener("", "0.0.0.0:"+strconv.Itoa(port), net.ListenConfig{})
+			defer func() {
+				if ln == nil {
+					return
+				}
+				require.NoError(t, ln.Close())
+			}()
+			require.NoError(t, listenErr)
+
+			// TODO: create some client certs and assert the authorizer works correctly with system:masters
+			//  and nested impersonation - we could also try to test what headers are sent to KAS
+		})
+	}
+}
 
 func TestImpersonator(t *testing.T) {
 	const testUser = "test-user"
