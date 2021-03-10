@@ -15,14 +15,11 @@ import (
 	"strings"
 	"time"
 
-	"go.pinniped.dev/internal/constable"
-	"go.pinniped.dev/internal/controller/apicerts"
-	"k8s.io/apimachinery/pkg/util/errors"
-
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/clock"
+	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	corev1informers "k8s.io/client-go/informers/core/v1"
@@ -33,7 +30,9 @@ import (
 	"go.pinniped.dev/internal/certauthority"
 	"go.pinniped.dev/internal/clusterhost"
 	"go.pinniped.dev/internal/concierge/impersonator"
+	"go.pinniped.dev/internal/constable"
 	pinnipedcontroller "go.pinniped.dev/internal/controller"
+	"go.pinniped.dev/internal/controller/apicerts"
 	"go.pinniped.dev/internal/controller/issuerconfig"
 	"go.pinniped.dev/internal/controllerlib"
 	"go.pinniped.dev/internal/dynamiccert"
@@ -221,8 +220,8 @@ func (c *impersonatorConfigController) doSync(syncCtx controllerlib.Context) (*v
 			return nil, err
 		}
 	} else {
-		if err = c.ensureImpersonatorIsStopped(true); err != nil { // TODO test this
-			return nil, err
+		if err = c.ensureImpersonatorIsStopped(true); err != nil {
+			return nil, err // TODO write unit test that errors during stopping the server are returned by sync
 		}
 	}
 
@@ -238,6 +237,8 @@ func (c *impersonatorConfigController) doSync(syncCtx controllerlib.Context) (*v
 
 	nameInfo, err := c.findDesiredTLSCertificateName(config)
 	if err != nil {
+		// Unexpected error while determining the name that should go into the certs, so clear any existing certs.
+		c.tlsServingCertDynamicCertProvider.Set(nil, nil)
 		return nil, err
 	}
 
@@ -344,15 +345,24 @@ func (c *impersonatorConfigController) tlsSecretExists() (bool, *v1.Secret, erro
 
 func (c *impersonatorConfigController) ensureImpersonatorIsStarted(syncCtx controllerlib.Context) error {
 	if c.serverStopCh != nil {
+		// The server was already started, but it could have died in the background, so make a non-blocking
+		// check to see if it has sent any errors on the errorCh.
 		select {
 		case runningErr := <-c.errorCh:
 			if runningErr == nil {
+				// The server sent a nil error, meaning that it shutdown without reporting any particular
+				// error for some reason. We would still like to report this as an error for logging purposes.
 				runningErr = constable.Error("unexpected shutdown of proxy server")
 			}
-			close(c.errorCh)
+			// The server has stopped, so finish shutting it down.
+			// If that fails too, return both errors for logging purposes.
+			// By returning an error, the sync function will be called again
+			// and we'll have a change to restart the server.
+			close(c.errorCh) // We don't want ensureImpersonatorIsStopped to block on reading this channel.
 			stoppingErr := c.ensureImpersonatorIsStopped(false)
 			return errors.NewAggregate([]error{runningErr, stoppingErr})
 		default:
+			// Seems like it is still running, so nothing to do.
 			return nil
 		}
 	}
@@ -361,8 +371,7 @@ func (c *impersonatorConfigController) ensureImpersonatorIsStarted(syncCtx contr
 	startImpersonatorFunc, err := c.impersonatorFunc(
 		impersonationProxyPort,
 		c.tlsServingCertDynamicCertProvider,
-		nil, // TODO write tests
-	//	dynamiccert.NewCAProvider(c.impersonationSigningCertProvider),
+		dynamiccert.NewCAProvider(c.impersonationSigningCertProvider),
 	)
 	if err != nil {
 		return err
@@ -371,9 +380,13 @@ func (c *impersonatorConfigController) ensureImpersonatorIsStarted(syncCtx contr
 	c.serverStopCh = make(chan struct{})
 	c.errorCh = make(chan error)
 
+	// startImpersonatorFunc will block until the server shuts down (or fails to start), so run it in the background.
 	go func() {
 		startOrStopErr := startImpersonatorFunc(c.serverStopCh)
+		// The server has stopped, so enqueue ourselves for another sync, so we can
+		// try to start the server again as quickly as possible.
 		syncCtx.Queue.AddRateLimited(syncCtx.Key)
+		// Forward any errors returned by startImpersonatorFunc on the errorCh.
 		c.errorCh <- startOrStopErr
 	}()
 
@@ -642,19 +655,19 @@ func (c *impersonatorConfigController) createCASecret(ctx context.Context) (*cer
 
 func (c *impersonatorConfigController) findDesiredTLSCertificateName(config *impersonator.Config) (*certNameInfo, error) {
 	if config.HasEndpoint() {
-		return c.findTLSCertificateNameFromEndpointConfig(config)
+		return c.findTLSCertificateNameFromEndpointConfig(config), nil
 	}
 	return c.findTLSCertificateNameFromLoadBalancer()
 }
 
-func (c *impersonatorConfigController) findTLSCertificateNameFromEndpointConfig(config *impersonator.Config) (*certNameInfo, error) {
+func (c *impersonatorConfigController) findTLSCertificateNameFromEndpointConfig(config *impersonator.Config) *certNameInfo {
 	endpointMaybeWithPort := config.Endpoint
 	endpointWithoutPort := strings.Split(endpointMaybeWithPort, ":")[0]
 	parsedAsIP := net.ParseIP(endpointWithoutPort)
 	if parsedAsIP != nil {
-		return &certNameInfo{ready: true, selectedIP: parsedAsIP, clientEndpoint: endpointMaybeWithPort}, nil
+		return &certNameInfo{ready: true, selectedIP: parsedAsIP, clientEndpoint: endpointMaybeWithPort}
 	}
-	return &certNameInfo{ready: true, selectedHostname: endpointWithoutPort, clientEndpoint: endpointMaybeWithPort}, nil
+	return &certNameInfo{ready: true, selectedHostname: endpointWithoutPort, clientEndpoint: endpointMaybeWithPort}
 }
 
 func (c *impersonatorConfigController) findTLSCertificateNameFromLoadBalancer() (*certNameInfo, error) {

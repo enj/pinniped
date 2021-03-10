@@ -297,15 +297,19 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 		var signingCACertPEM, signingCAKeyPEM []byte
 		var signingCASecret *corev1.Secret
 		var testHTTPServer *http.Server
+		var testHTTPServerInterruptCh chan struct{}
 		var queue *testQueue
+		var validClientCert *tls.Certificate
 
 		var impersonatorFunc = func(
 			port int,
 			dynamicCertProvider dynamiccertificates.CertKeyContentProvider,
-			impersonationProxySignerCA dynamiccertificates.CAContentProvider,
+			impersonationProxySignerCAProvider dynamiccertificates.CAContentProvider,
 		) (func(stopCh <-chan struct{}) error, error) {
 			impersonatorFuncWasCalled++
 			r.Equal(8444, port)
+			r.NotNil(dynamicCertProvider)
+			r.NotNil(impersonationProxySignerCAProvider)
 
 			if impersonatorFuncError != nil {
 				return nil, impersonatorFuncError
@@ -319,6 +323,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				if impersonatorFuncReturnedFuncError != nil {
 					return impersonatorFuncReturnedFuncError
 				}
+
 				var err error
 				// automatically choose the port for unit tests
 				startedTLSListener, err = tls.Listen("tcp", localhostIP+":0", &tls.Config{
@@ -332,13 +337,39 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						}
 						return nil, nil // no cached TLS certs
 					},
-					// TODO do something with impersonationProxySignerCA for client cert auth
+					ClientAuth: tls.RequestClientCert,
+					VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+						// Docs say that this will always be called in tls.RequestClientCert mode
+						// and that the second parameter will always be nil in that case.
+						// rawCerts will be raw ASN.1 certificates provided by the peer.
+						if rawCerts == nil || len(rawCerts) != 1 {
+							return fmt.Errorf("expected to get one client cert on incoming request to test server")
+						}
+						clientCert := rawCerts[0]
+						currentClientCertCA := impersonationProxySignerCAProvider.CurrentCABundleContent()
+						if currentClientCertCA == nil {
+							return fmt.Errorf("impersonationProxySignerCAProvider does not have a current CA certificate")
+						}
+						// Assert that the client's cert was signed by the CA cert that the controller put into
+						// the CAContentProvider that was passed in.
+						parsed, err := x509.ParseCertificate(clientCert)
+						require.NoError(t, err)
+						t.Log("PARSED CLIENT CERT")
+						roots := x509.NewCertPool()
+						require.True(t, roots.AppendCertsFromPEM(currentClientCertCA))
+						opts := x509.VerifyOptions{Roots: roots}
+						_, err = parsed.Verify(opts)
+						require.NoError(t, err)
+						return nil
+					},
 				})
 				r.NoError(err)
+
 				testHTTPServer = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 					_, err := fmt.Fprint(w, fakeServerResponseBody)
 					r.NoError(err)
 				})}
+
 				// Start serving requests in the background.
 				go func() {
 					err := testHTTPServer.Serve(startedTLSListener)
@@ -348,8 +379,16 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					}
 				}()
 
-				// Start waiting for the stopCh to be closed in the foreground, and kill the server when that happens.
-				<-stopCh
+				if testHTTPServerInterruptCh == nil {
+					// Wait in the foreground for the stopCh to be closed, and kill the server when that happens.
+					// This is similar to the behavior of the real impersonation server.
+					<-stopCh
+				} else {
+					// The test supplied an interrupt channel because it wants to test unexpected termination
+					// of the server, so wait for that channel to close instead of waiting for the one that
+					// was passed in from the production code.
+					<-testHTTPServerInterruptCh
+				}
 
 				err = testHTTPServer.Close()
 				t.Log("Got an unexpected error while stopping the fake http server!")
@@ -400,8 +439,13 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				rootCAs := x509.NewCertPool()
 				rootCAs.AppendCertsFromPEM(caCrt)
 				tr = &http.Transport{
-					TLSClientConfig: &tls.Config{RootCAs: rootCAs},
-					DialContext:     overrideDialContext,
+					TLSClientConfig: &tls.Config{
+						// Server's TLS serving cert CA
+						RootCAs: rootCAs,
+						// Client cert which is supposed to work against the server's dynamic CAContentProvider
+						Certificates: []tls.Certificate{*validClientCert},
+					},
+					DialContext: overrideDialContext,
 				}
 			}
 			client := &http.Client{Transport: tr}
@@ -921,6 +965,8 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			signingCAKeyPEM, err = ca.PrivateKeyToPEM()
 			r.NoError(err)
 			signingCASecret = newSigningKeySecret(caSignerName, signingCACertPEM, signingCAKeyPEM)
+			validClientCert, err = ca.Issue(pkix.Name{}, nil, nil, time.Hour)
+			r.NoError(err)
 		})
 
 		it.After(func() {
@@ -1203,7 +1249,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					addSecretToTrackers(tlsSecret, kubeAPIClient, kubeInformerClient)
 				})
 
-				it("returns an error and keeps running the proxy with the old cert", func() {
+				it("returns an error and keeps the proxy running but now without certs", func() {
 					startInformersAndController()
 					r.NoError(runControllerSync())
 					r.Len(kubeAPIClient.Actions(), 1)
@@ -1215,7 +1261,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 					errString := "could not find valid IP addresses or hostnames from load balancer some-namespace/some-service-resource-name"
 					r.EqualError(runControllerSync(), errString)
 					r.Len(kubeAPIClient.Actions(), 1) // no new actions
-					requireTLSServerIsRunning(caCrt, testServerAddr(), nil)
+					requireTLSServerIsRunningWithoutCerts()
 					requireCredentialIssuer(newErrorStrategy(errString))
 					requireSigningCertProviderIsEmpty()
 				})
@@ -1510,7 +1556,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
 						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
-						// Simulate the informer cache's background update from its watch for the CA Secret.
+						// Simulate the informer cache's background update from its watch.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Secrets())
 
 						// Delete the TLS Secret that was just created from the Kube API server. Note that we never
@@ -1548,7 +1594,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
 						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
-						// Simulate the informer cache's background update from its watch for the CA Secret.
+						// Simulate the informer cache's background update from its watch.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
 
 						// Delete the CA Secret that was just created from the Kube API server. Note that we never
@@ -1586,7 +1632,7 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 						requireCredentialIssuer(newSuccessStrategy(fakeHostname, ca))
 						requireSigningCertProviderHasLoadedCerts(signingCACertPEM, signingCAKeyPEM)
 
-						// Simulate the informer cache's background update from its watch for the CA Secret.
+						// Simulate the informer cache's background update from its watch.
 						addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
 
 						// Simulate someone updating the CA Secret out of band, e.g. when a human edits it with kubectl.
@@ -1905,13 +1951,13 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 			})
 		})
 
-		when("the impersonator start function returned by the impersonatorFunc returns an error", func() {
+		when("the impersonator start function returned by the impersonatorFunc returns an error immediately", func() {
 			it.Before(func() {
 				addNodeWithRoleToTracker("worker", kubeAPIClient)
-				impersonatorFuncReturnedFuncError = errors.New("some impersonator startup error")
+				impersonatorFuncReturnedFuncError = errors.New("some immediate impersonator startup error")
 			})
 
-			it("returns an error on the second run", func() {
+			it("causes an immediate resync, returns an error on that next sync, and then restarts the server in a following sync", func() {
 				startInformersAndController()
 				// The failure happens in a background goroutine, so the first sync succeeds.
 				r.NoError(runControllerSync())
@@ -1925,23 +1971,77 @@ func TestImpersonatorConfigControllerSync(t *testing.T) {
 				requireCredentialIssuer(newPendingStrategy())
 				requireSigningCertProviderIsEmpty()
 
+				// Simulate the informer cache's background update from its watch.
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
 				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
 
-				// The controller should have requested to re-enqueue the original sync key.
+				// The controller's first sync should have started a background routine which, when the server dies,
+				// requests to re-enqueue the original sync key to cause its sync method to get called again in the near future.
 				r.Eventually(func() bool {
 					return syncContext.Key == queue.key
 				}, 10*time.Second, 10*time.Millisecond)
 
-				// The next sync should error because the server died in the background
-				r.EqualError(runControllerSync(), "some impersonator startup error")
-				requireCredentialIssuer(newErrorStrategy("some impersonator startup error"))
+				// The next sync should error because the server died in the background. This second
+				// sync should be able to detect the error and return it.
+				r.EqualError(runControllerSync(), "some immediate impersonator startup error")
+				requireCredentialIssuer(newErrorStrategy("some immediate impersonator startup error"))
 				requireSigningCertProviderIsEmpty()
 
-				// pretend the server is not going to die anymore
+				// Next time the controller starts the server, the server will start successfully.
 				impersonatorFuncReturnedFuncError = nil
 
-				// now everything should be working correctly
+				// One more sync and the controller should try to restart the server.
+				// Now everything should be working correctly.
+				r.NoError(runControllerSync())
+				requireTLSServerIsRunningWithoutCerts()
+				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
+			})
+		})
+
+		when("the impersonator server dies for no apparent reason after running for a while", func() {
+			it.Before(func() {
+				addNodeWithRoleToTracker("worker", kubeAPIClient)
+			})
+
+			it("causes an immediate resync, returns an error on that next sync, and then restarts the server in a following sync", func() {
+				// Prepare to be able to cause the server to die for no apparent reason.
+				testHTTPServerInterruptCh = make(chan struct{})
+
+				startInformersAndController()
+				r.NoError(runControllerSync())
+				r.Len(kubeAPIClient.Actions(), 3)
+				requireNodesListed(kubeAPIClient.Actions()[0])
+				requireLoadBalancerWasCreated(kubeAPIClient.Actions()[1])
+				requireCASecretWasCreated(kubeAPIClient.Actions()[2])
+				requireCredentialIssuer(newPendingStrategy())
+				requireSigningCertProviderIsEmpty()
+				requireTLSServerIsRunningWithoutCerts()
+
+				// Simulate the informer cache's background update from its watch.
+				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[1], kubeInformers.Core().V1().Services())
+				addObjectFromCreateActionToInformerAndWait(kubeAPIClient.Actions()[2], kubeInformers.Core().V1().Secrets())
+
+				// Simulate that impersonation server dies for no apparent reason.
+				close(testHTTPServerInterruptCh)
+
+				// The controller's first sync should have started a background routine which, when the server dies,
+				// requests to re-enqueue the original sync key to cause its sync method to get called again in the near future.
+				r.Eventually(func() bool {
+					return syncContext.Key == queue.key
+				}, 10*time.Second, 10*time.Millisecond)
+
+				// The next sync should error because the server died in the background. This second
+				// sync should be able to detect the error and return it.
+				r.EqualError(runControllerSync(), "unexpected shutdown of proxy server")
+				requireCredentialIssuer(newErrorStrategy("unexpected shutdown of proxy server"))
+				requireSigningCertProviderIsEmpty()
+
+				// Next time the controller starts the server, the server should behave as normal.
+				testHTTPServerInterruptCh = nil
+
+				// One more sync and the controller should try to restart the server.
+				// Now everything should be working correctly.
 				r.NoError(runControllerSync())
 				requireTLSServerIsRunningWithoutCerts()
 				requireCredentialIssuer(newPendingStrategy())
