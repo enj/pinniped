@@ -385,7 +385,7 @@ func (c *impersonatorConfigController) ensureImpersonatorIsStarted(syncCtx contr
 		startOrStopErr := startImpersonatorFunc(c.serverStopCh)
 		// The server has stopped, so enqueue ourselves for another sync, so we can
 		// try to start the server again as quickly as possible.
-		syncCtx.Queue.AddRateLimited(syncCtx.Key)
+		syncCtx.Queue.AddRateLimited(syncCtx.Key) // TODO this a race because the main controller go routine could run and complete before we send on the err chan
 		// Forward any errors returned by startImpersonatorFunc on the errorCh.
 		c.errorCh <- startOrStopErr
 	}()

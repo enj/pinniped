@@ -4,7 +4,6 @@
 package impersonator
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httputil"
@@ -16,7 +15,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/request"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -79,7 +77,7 @@ func New(
 	if err != nil {
 		return nil, err
 	}
-	recommendedOptions.Authentication.ClientCert.ClientCA = "---irrelevant-but-needs-to-be-non-empty---"
+	recommendedOptions.Authentication.ClientCert.ClientCA = "---irrelevant-but-needs-to-be-non-empty---" // drop when we pick up https://github.com/kubernetes/kubernetes/pull/100055
 	recommendedOptions.Authentication.ClientCert.CAContentProvider = dynamiccertificates.NewUnionCAContentProvider(impersonationProxySignerCA, kubeClientCA)
 
 	if recOpts != nil {
@@ -181,10 +179,6 @@ func newImpersonationReverseProxy(restConfig *rest.Config) (http.Handler, error)
 		return nil, fmt.Errorf("could not get in-cluster transport: %w", err)
 	}
 
-	reverseProxy := httputil.NewSingleHostReverseProxy(serverURL)
-	reverseProxy.Transport = kubeRoundTripper
-	reverseProxy.FlushInterval = 200 * time.Millisecond // the "watch" verb will not work without this line
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// TODO integration test using a bearer token
 		if len(r.Header.Values("Authorization")) != 0 {
@@ -225,54 +219,24 @@ func newImpersonationReverseProxy(restConfig *rest.Config) (http.Handler, error)
 			return
 		}
 
-		// Never mutate request (see http.Handler docs).
-		newR := r.Clone(r.Context())
-		newR.Header = getProxyHeaders(userInfo, r.Header)
-
 		plog.Trace("proxying authenticated request",
 			"url", r.URL.String(),
 			"method", r.Method,
+			"username", userInfo.GetName(), // this info leak seems fine for trace level logs
 		)
-		reverseProxy.ServeHTTP(w, newR)
+
+		reverseProxy := httputil.NewSingleHostReverseProxy(serverURL)
+		impersonateConfig := transport.ImpersonationConfig{
+			UserName: userInfo.GetName(),
+			Groups:   userInfo.GetGroups(),
+			Extra:    userInfo.GetExtra(),
+		}
+		reverseProxy.Transport = transport.NewImpersonatingRoundTripper(impersonateConfig, kubeRoundTripper)
+		reverseProxy.FlushInterval = 200 * time.Millisecond // the "watch" verb will not work without this line
+		// transport.NewImpersonatingRoundTripper clones the request before setting headers
+		// so this call will not accidentally mutate the input request (see http.Handler docs)
+		reverseProxy.ServeHTTP(w, r)
 	}), nil
-}
-
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
-func getProxyHeaders(userInfo user.Info, requestHeaders http.Header) http.Header {
-	newHeaders := requestHeaders.Clone()
-
-	// Leverage client-go's impersonation RoundTripper to set impersonation headers for us in the new
-	// request. The client-go RoundTripper not only sets all of the impersonation headers for us, but
-	// it also does some helpful escaping of characters that can't go into an HTTP header. To do this,
-	// we make a fake call to the impersonation RoundTripper with a fake HTTP request and a delegate
-	// RoundTripper that captures the impersonation headers set on the request.
-	impersonateConfig := transport.ImpersonationConfig{
-		UserName: userInfo.GetName(),
-		Groups:   userInfo.GetGroups(),
-		Extra:    userInfo.GetExtra(),
-	}
-	impersonateHeaderSpy := roundTripperFunc(func(r *http.Request) (*http.Response, error) {
-		newHeaders.Set(transport.ImpersonateUserHeader, r.Header.Get(transport.ImpersonateUserHeader))
-		for _, groupHeaderValue := range r.Header.Values(transport.ImpersonateGroupHeader) {
-			newHeaders.Add(transport.ImpersonateGroupHeader, groupHeaderValue)
-		}
-		for headerKey, headerValues := range r.Header {
-			if strings.HasPrefix(headerKey, transport.ImpersonateUserExtraHeaderPrefix) {
-				for _, headerValue := range headerValues {
-					newHeaders.Add(headerKey, headerValue)
-				}
-			}
-		}
-		return nil, nil
-	})
-	fakeReq, _ := http.NewRequestWithContext(context.Background(), "", "", nil)
-	//nolint:bodyclose // We return a nil http.Response above, so there is nothing to close.
-	_, _ = transport.NewImpersonatingRoundTripper(impersonateConfig, impersonateHeaderSpy).RoundTrip(fakeReq)
-
-	return newHeaders
 }
 
 func ensureNoImpersonationHeaders(r *http.Request) error {
